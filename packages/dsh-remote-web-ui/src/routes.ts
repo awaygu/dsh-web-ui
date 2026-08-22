@@ -88,6 +88,7 @@ export const PAIR_PATHS = {
   issue: '/api/pair/issue',
   accept: '/api/pair/accept',
   stop: '/api/pair/stop',
+  revoke: '/api/pair/revoke',
   heartbeat: '/api/pair/heartbeat',
   status: '/api/pair/status',
   events: '/api/pair/events',
@@ -107,6 +108,9 @@ export const issuePayloadSchema = z.object({
 })
 export const acceptPayloadSchema = z.object({
   token: z.string().default(''),
+})
+export const revokePayloadSchema = z.object({
+  deviceId: z.string().min(1),
 })
 export const pairActionPayloadSchema = z.object({}).passthrough()
 
@@ -191,6 +195,8 @@ export interface PairRoutesDeps {
   service: PairingService
   /** The LAN IP literals the fence accepts (derived from the bind host). */
   lanAddresses: readonly string[]
+  /** Current desktop gate policy, re-read for every status response. */
+  requirePairingForLan?: boolean | (() => boolean)
 }
 
 /**
@@ -199,7 +205,10 @@ export interface PairRoutesDeps {
  * @returns the exact routes to register on webServer.
  */
 export function makeRoutes(deps: PairRoutesDeps): WebRoute[] {
-  const { service, lanAddresses } = deps
+  const { service, lanAddresses, requirePairingForLan = true } = deps
+  const pairingRequired = (): boolean => typeof requirePairingForLan === 'function'
+    ? requirePairingForLan()
+    : requirePairingForLan
   const events = new PairingEventsStream(service)
 
   /** Loopback-only fence: the desktop panel's control endpoints. */
@@ -222,7 +231,16 @@ export function makeRoutes(deps: PairRoutesDeps): WebRoute[] {
   const ACCEPT_MAX_ATTEMPTS = 10
   const ACCEPT_WINDOW_MS = 30_000
   const rateLimitAccept = (req: IncomingMessage): boolean => {
-    const ip = (req.socket as { remoteAddress?: string } | undefined)?.remoteAddress ?? 'unknown'
+    const socketIp = (req.socket as { remoteAddress?: string } | undefined)?.remoteAddress ?? 'unknown'
+    // Behind the auto-tunnel every internet client arrives from 127.0.0.1,
+    // so a single shared bucket would let one attacker keep the legitimate
+    // owner rate-limited. Partition the availability bucket by the first
+    // client-visible XFF hop (set by the tunnel edge): XFF is untrusted for
+    // authentication and only separates buckets, it never grants access.
+    const forwarded = typeof req.headers['x-forwarded-for'] === 'string'
+      ? (req.headers['x-forwarded-for'].split(',')[0] ?? '').trim()
+      : undefined
+    const ip = forwarded === undefined || forwarded === '' ? socketIp : socketIp + '|' + forwarded
     const nowMs = Date.now()
     // The map lives as long as the plugin: prune expired windows once the
     // table grows past a modest size so distinct source IPs (LAN clients,
@@ -301,11 +319,15 @@ export function makeRoutes(deps: PairRoutesDeps): WebRoute[] {
       writeJson(res, 400, { ok: false, code: 'bad-payload' })
       return
     }
-    const result = service.accept(payload.token)
+    const ua = req.headers['user-agent']
+    const result = service.accept(payload.token, typeof ua === 'string' ? ua : undefined)
     if (!result.ok) {
       writeJson(res, result.code === 'used' ? 409 : 404, { ok: false, code: result.code })
       return
     }
+    // No Secure attribute: LAN pairing runs over plain HTTP (the cookie must
+    // work there), and the same cookie rides HTTPS on the tunnel. Lax keeps
+    // top-level navigations working while blocking cross-site subrequests.
     res.writeHead(200, {
       'content-type': 'application/json; charset=utf-8',
       'set-cookie': [
@@ -327,6 +349,26 @@ export function makeRoutes(deps: PairRoutesDeps): WebRoute[] {
       return
     }
     service.stop()
+    writeJson(res, 200, { ok: true })
+  }
+
+  const handleRevoke = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+    if (!requireMethod(req, res, 'POST')) return
+    if (!loopbackFence(req)) {
+      writeJson(res, 403, { ok: false, code: 'forbidden' })
+      return
+    }
+    const body = await readJsonBody(req)
+    const payload = parsePairPayload(revokePayloadSchema, body)
+    if (payload === undefined) {
+      writeJson(res, 400, { ok: false, code: 'bad-payload' })
+      return
+    }
+    const revoked = service.revoke(payload.deviceId)
+    if (!revoked) {
+      writeJson(res, 404, { ok: false, code: 'unknown-device' })
+      return
+    }
     writeJson(res, 200, { ok: true })
   }
 
@@ -356,7 +398,18 @@ export function makeRoutes(deps: PairRoutesDeps): WebRoute[] {
       return
     }
     const deviceId = readCookie(req.headers.cookie, service.config.cookieName)
-    writeJson(res, 200, { ok: true, paired: deviceId !== undefined && service.hasDevice(deviceId), ...service.snapshot() })
+    const paired = deviceId !== undefined && service.hasDevice(deviceId)
+    const snapshot = service.snapshot()
+    // Unpaired LAN/tunnel clients get only the pairing-relevant fields; the
+    // token expiry, public tunnel URL, and counts are an oracle for targeting
+    // and stay behind a live device cookie. The per-device roster (ids are
+    // session credentials) is never returned here — only the loopback events
+    // stream carries it to the desktop panel.
+    const { devices: _devices, ...rest } = snapshot
+    const visible = paired
+      ? rest
+      : { phase: snapshot.phase, lanAvailable: snapshot.lanAvailable, lanAddresses: snapshot.lanAddresses }
+    writeJson(res, 200, { ok: true, paired, requirePairingForLan: pairingRequired(), ...visible })
   }
 
   const handleEvents = (req: IncomingMessage, res: ServerResponse): void => {
@@ -374,6 +427,7 @@ export function makeRoutes(deps: PairRoutesDeps): WebRoute[] {
     { kind: 'exact', path: PAIR_PATHS.issue, handler: handleIssue },
     { kind: 'exact', path: PAIR_PATHS.accept, handler: handleAccept },
     { kind: 'exact', path: PAIR_PATHS.stop, handler: handleStop },
+    { kind: 'exact', path: PAIR_PATHS.revoke, handler: handleRevoke },
     { kind: 'exact', path: PAIR_PATHS.heartbeat, handler: handleHeartbeat },
     { kind: 'exact', path: PAIR_PATHS.status, handler: handleStatus },
     { kind: 'exact', path: PAIR_PATHS.events, handler: handleEvents },

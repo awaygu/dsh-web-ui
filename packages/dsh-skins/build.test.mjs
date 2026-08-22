@@ -1,34 +1,26 @@
 import assert from 'node:assert/strict'
-import fs from 'node:fs'
-import os from 'node:os'
-import path from 'node:path'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import test from 'node:test'
-import { syncDir } from './build.mjs'
 
-test('carrier preserves component license and attribution without dsh.bundle', (t) => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-skins-build-'))
-  t.after(() => { fs.rmSync(root, { recursive: true, force: true }) })
-  const source = path.join(root, 'source')
-  const output = path.join(root, 'output')
-  const skin = path.join(source, 'licensed-skin')
-  fs.mkdirSync(path.join(skin, 'lib'), { recursive: true })
-  fs.writeFileSync(path.join(skin, 'skin.json'), JSON.stringify({ id: 'licensed-skin' }))
-  fs.writeFileSync(path.join(skin, 'lib', 'client.js'), 'client')
-  fs.writeFileSync(path.join(skin, 'lib', 'index.js'), 'host')
-  fs.writeFileSync(path.join(skin, 'package.json'), JSON.stringify({
-    name: '@example/licensed-skin',
-    version: '1.2.3',
-    license: 'CC-BY-NC-SA-4.0',
-  }))
-  fs.writeFileSync(path.join(skin, 'LICENSE'), 'license text')
-  fs.writeFileSync(path.join(skin, 'NOTICE'), 'attribution text')
+import { buildCompatibilityShims, LEGACY_SKIN_IDS } from './build.mjs'
 
-  syncDir(source, output)
+test('builds resolvable no-op packages for every retired v1 skin junction', async (t) => {
+  const out = mkdtempSync(join(tmpdir(), 'dsh-skins-shims-'))
+  t.after(() => rmSync(out, { recursive: true, force: true }))
+  buildCompatibilityShims(out)
 
-  const carrier = path.join(output, 'licensed-skin')
-  const manifest = JSON.parse(fs.readFileSync(path.join(carrier, 'package.json'), 'utf8'))
-  assert.equal(manifest.license, 'CC-BY-NC-SA-4.0')
-  assert.deepEqual(manifest.dsh, { client: { inject: [], platform: 'web' } })
-  assert.equal(fs.readFileSync(path.join(carrier, 'LICENSE'), 'utf8'), 'license text')
-  assert.equal(fs.readFileSync(path.join(carrier, 'NOTICE'), 'utf8'), 'attribution text')
+  for (const id of LEGACY_SKIN_IDS) {
+    const dir = join(out, id)
+    const pkg = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8'))
+    assert.equal(pkg.name, `@linxin666/dsh-client-ui-skin-${id}`)
+    assert.equal(typeof (await import(join(dir, 'lib', 'index.js'))).apply, 'function')
+    assert.match(readFileSync(join(dir, 'lib', 'client.js'), 'utf8'), new RegExp(`skin-${id}`))
+  }
+
+  const link = join(out, 'node_modules', '@linxin666', 'dsh-client-ui-skin-whale-song')
+  mkdirSync(join(link, '..'), { recursive: true })
+  symlinkSync(join(out, 'whale-song'), link, process.platform === 'win32' ? 'junction' : 'dir')
+  assert.equal(typeof (await import(join(link, 'lib', 'index.js'))).apply, 'function')
 })

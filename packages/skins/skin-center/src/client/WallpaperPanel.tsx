@@ -11,8 +11,19 @@
  */
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from 'react'
 import type { PropsLocale } from '@deepseek-ai/dsh-client-ui-slots'
-import type { WallpaperDescriptor, WallpaperHandle } from './wallpaper.ts'
+import { resolveSelection, type WallpaperDescriptor, type WallpaperHandle } from './wallpaper.ts'
 import css from './skin-center.module.css'
+import { SliderControl } from './SliderControl.tsx'
+
+/** Live-label helper: the shown value follows the in-drag thumb immediately,
+ * and falls back to the store value once the store settles (issue #725). */
+function useLiveValue(value: number): [number, (v: number | null) => void] {
+  const [live, setLive] = useState<number | null>(null)
+  useEffect(() => {
+    setLive(null)
+  }, [value])
+  return [live ?? value, setLive]
+}
 
 /** Host base path of the wallpaper API (mirrors src/we-routes.ts). */
 const WE_API = '/api/skin-center/we'
@@ -65,12 +76,18 @@ export function WallpaperPanel({ t, wallpaper }: { t: PropsLocale<'skinCenter'>[
   const enabled = useSyncExternalStore(wallpaper.subscribe, wallpaper.enabled)
   const selection = useSyncExternalStore(wallpaper.subscribe, wallpaper.selection)
   const mode = useSyncExternalStore(wallpaper.subscribe, wallpaper.mode)
+  const fit = useSyncExternalStore(wallpaper.subscribe, wallpaper.fit)
   const dim = useSyncExternalStore(wallpaper.subscribe, wallpaper.dim)
   const blur = useSyncExternalStore(wallpaper.subscribe, wallpaper.wallpaperBlur)
   const pauseOnHidden = useSyncExternalStore(wallpaper.subscribe, wallpaper.pauseOnHidden)
+  const sound = useSyncExternalStore(wallpaper.subscribe, wallpaper.sound)
+  const volume = useSyncExternalStore(wallpaper.subscribe, wallpaper.volume)
   const activeId = useSyncExternalStore(wallpaper.subscribe, wallpaper.activeId)
   const trying = useSyncExternalStore(wallpaper.subscribe, wallpaper.trying)
   const dirs = useSyncExternalStore(wallpaper.subscribe, wallpaper.dirs)
+  const [shownDim, setShownDim] = useLiveValue(dim)
+  const [shownBlur, setShownBlur] = useLiveValue(blur)
+  const [shownVolume, setShownVolume] = useLiveValue(volume)
   const [dirInput, setDirInput] = useState('')
 
   const [items, setItems] = useState<WallpaperItem[] | null>(null)
@@ -99,7 +116,7 @@ export function WallpaperPanel({ t, wallpaper }: { t: PropsLocale<'skinCenter'>[
         setItems(payload.wallpapers)
         setInstallDir(typeof payload.installDir === 'string' ? payload.installDir : null)
         const selected = wallpaper.selection()
-        wallpaper.sync(payload.wallpapers.find(w => w.id === selected) ?? null)
+        wallpaper.sync(resolveSelection(payload.wallpapers, selected) ?? null)
       })
       .catch((error: unknown) => {
         if (!mounted.current) return
@@ -133,6 +150,7 @@ export function WallpaperPanel({ t, wallpaper }: { t: PropsLocale<'skinCenter'>[
     videoUrl: item.videoUrl,
     webUrl: item.webUrl,
     frameUrl: item.frameUrl,
+    sceneUrl: item.sceneUrl,
     previewUrl: item.previewUrl,
   })
 
@@ -197,34 +215,60 @@ export function WallpaperPanel({ t, wallpaper }: { t: PropsLocale<'skinCenter'>[
                   {t('wallpaperClear')}
                 </button>
               </div>
+              <div className={css.themeRow}>
+                <span className={css.themeLabel}>{t('wallpaperFit')}</span>
+                <button
+                  type="button"
+                  className={css.themeButton + (fit === 'cover' ? ' ' + css.themeButtonActive : '')}
+                  onClick={() => { wallpaper.setFit('cover') }}
+                >
+                  {t('wallpaperFitCover')}
+                </button>
+                <button
+                  type="button"
+                  className={css.themeButton + (fit === 'contain' ? ' ' + css.themeButtonActive : '')}
+                  onClick={() => { wallpaper.setFit('contain') }}
+                >
+                  {t('wallpaperFitContain')}
+                </button>
+                <button
+                  type="button"
+                  className={css.themeButton + (fit === 'fill' ? ' ' + css.themeButtonActive : '')}
+                  onClick={() => { wallpaper.setFit('fill') }}
+                >
+                  {t('wallpaperFitFill')}
+                </button>
+              </div>
               <div className={css.backgroundRow}>
                 <div className={css.backgroundHead}>
                   <span className={css.backgroundLabel}>{t('wallpaperDim')}</span>
-                  <span className={css.backgroundValue} aria-hidden="true">{dim}%</span>
+                  <span className={css.backgroundValue} aria-hidden="true">{shownDim}%</span>
                 </div>
-                <input
+                                <SliderControl
                   className={css.backgroundRange}
-                  type="range"
-                  min="0"
-                  max="90"
-                  step="5"
+                  min={0}
+                  max={90}
+                  step={5}
                   value={dim}
-                  aria-label={t('wallpaperDim')}
-                  onChange={(event) => { wallpaper.setDim(Number(event.target.value)) }}
+                  ariaValuetext={shownDim + '%'}
+                  ariaLabel={t('wallpaperDim')}
+                  onChanging={setShownDim}
+                  onChange={(value) => { wallpaper.setDim(value) }}
                 />
                 <div className={css.backgroundHead}>
                   <span className={css.backgroundLabel}>{t('wallpaperBlur')}</span>
-                  <span className={css.backgroundValue} aria-hidden="true">{blur}px</span>
+                  <span className={css.backgroundValue} aria-hidden="true">{shownBlur}px</span>
                 </div>
-                <input
+                                <SliderControl
                   className={css.backgroundRange}
-                  type="range"
-                  min="0"
-                  max="60"
-                  step="1"
+                  min={0}
+                  max={60}
+                  step={1}
                   value={blur}
-                  aria-label={t('wallpaperBlur')}
-                  onChange={(event) => { wallpaper.setBlur(Number(event.target.value)) }}
+                  ariaValuetext={shownBlur + 'px'}
+                  ariaLabel={t('wallpaperBlur')}
+                  onChanging={setShownBlur}
+                  onChange={(value) => { wallpaper.setBlur(value) }}
                 />
               </div>
               <div className={css.enableRow}>
@@ -240,6 +284,38 @@ export function WallpaperPanel({ t, wallpaper }: { t: PropsLocale<'skinCenter'>[
                   <span className={css.switchThumb} />
                 </button>
               </div>
+              <div className={css.enableRow}>
+                <span className={css.enableLabel} title={t('wallpaperSoundHint')}>{t('wallpaperSound')}</span>
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={sound}
+                  aria-label={t('wallpaperSound')}
+                  className={sound ? css.switch + ' ' + css.switchOn : css.switch}
+                  onClick={() => { wallpaper.setSound(!sound) }}
+                >
+                  <span className={css.switchThumb} />
+                </button>
+              </div>
+              {sound && (
+                <div className={css.backgroundRow}>
+                  <div className={css.backgroundHead}>
+                    <span className={css.backgroundLabel}>{t('wallpaperVolume')}</span>
+                    <span className={css.backgroundValue} aria-hidden="true">{shownVolume}%</span>
+                  </div>
+                                  <SliderControl
+                  className={css.backgroundRange}
+                  min={0}
+                  max={100}
+                  step={5}
+                  value={volume}
+                  ariaValuetext={shownVolume + '%'}
+                  ariaLabel={t('wallpaperVolume')}
+                  onChanging={setShownVolume}
+                  onChange={(value) => { wallpaper.setVolume(value) }}
+                />
+                </div>
+              )}
             </div>
           )}
 

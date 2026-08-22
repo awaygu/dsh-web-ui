@@ -1,16 +1,18 @@
 /**
  * The /api/dsh-skill-explorer route family: list (grouped by source), set
  * enabled (rewrites SKILL.md frontmatter), create, delete (move to .trash)
- * and health. Every route carries a loopback-only trust fence plus browser
- * same-origin markers — the write routes touch real skill files, so
- * LAN-exposed dsh web deployments must not serve them.
+ * and health. Every route carries the shared trust fence (loopback by
+ * default; a live paired-device cookie is an extra allow path when
+ * remote-web-ui is loaded) plus browser same-origin markers — the write
+ * routes touch real skill files, so unpaired LAN clients must not reach them.
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import type { Context } from '@deepseek-ai/cordis'
 import type { WebRoute } from '@deepseek-ai/dsh-host-webserver'
+import { isSkillExplorerAllowed } from './access.ts'
 import { buildPayload, collectSkills, findProjectRoot, projectSkillRoot, trashSkillFile, userSkillRoot, writeSkillFile, type CollectOptions, type SkillEntry } from './collect.ts'
 import { setFrontmatterField } from './frontmatter.ts'
-import { isLoopbackRequest } from './loopback.ts'
 
 /** Cap on JSON request bodies (create payloads are small). */
 const MAX_JSON_BODY_BYTES = 128 * 1024
@@ -79,15 +81,16 @@ export const DEFAULT_CWD = (): string => process.cwd()
 
 /**
  * Build every /api/dsh-skill-explorer route (exact paths).
+ * @param ctx - host context; may expose remoteWebUiPairing.
  * @param deps - dshHome/agentsHome/registry/sessions.
  * @returns the route list for ctx.webServer.register.
  */
-export function makeRoutes(deps: SkillRoutesDeps): WebRoute[] {
+export function makeRoutes(ctx: Context, deps: SkillRoutesDeps): WebRoute[] {
   const { dshHome, agentsHome, customSkillDirs, registry, activeSessionCwds, logger } = deps
 
   /** Guard helper: fence + method check. */
   const guard = (req: IncomingMessage, res: ServerResponse, method: string): boolean => {
-    if (!isLoopbackRequest(req)) {
+    if (!isSkillExplorerAllowed(ctx, req)) {
       writeJson(res, 403, { error: 'forbidden: loopback-only' })
       return false
     }
@@ -123,6 +126,25 @@ export function makeRoutes(deps: SkillRoutesDeps): WebRoute[] {
     return skills.find((candidate) => candidate.name === name)
   }
 
+  /** Resolve the exact editable file shown by the client, rejecting stale same-name fallbacks. */
+  const resolveMutationSkill = async (
+    name: string,
+    expectedPath: string,
+    cwd: string,
+    res: ServerResponse,
+  ): Promise<(SkillEntry & { path: string }) | undefined> => {
+    const skill = await findSkill(name, cwd)
+    if (skill?.path === undefined) {
+      writeJson(res, 404, { error: `skill ${name} has no editable file` })
+      return undefined
+    }
+    if (skill.path !== expectedPath) {
+      writeJson(res, 409, { error: `skill ${name} changed since the panel loaded; refresh and retry` })
+      return undefined
+    }
+    return skill as SkillEntry & { path: string }
+  }
+
   const routes: WebRoute[] = [
     {
       kind: 'exact',
@@ -154,17 +176,15 @@ export function makeRoutes(deps: SkillRoutesDeps): WebRoute[] {
             writeJson(res, 400, { error: 'invalid JSON body' })
             return
           }
-          const { name, enabled } = body
-          if (typeof name !== 'string' || !NAME_PATTERN.test(name) || typeof enabled !== 'boolean') {
-            writeJson(res, 400, { error: 'expected { name, enabled }' })
+          const { name, path, enabled } = body
+          if (typeof name !== 'string' || !NAME_PATTERN.test(name) || typeof path !== 'string' || path.trim() === '' || typeof enabled !== 'boolean') {
+            writeJson(res, 400, { error: 'expected { name, path, enabled }' })
             return
           }
-          // Only trust paths from a fresh scan (no arbitrary path writes).
-          const skill = await findSkill(name, DEFAULT_CWD())
-          if (skill === undefined || skill.path === undefined) {
-            writeJson(res, 404, { error: `skill ${name} has no editable file (bundled/runtime skills cannot be toggled)` })
-            return
-          }
+          // The client path is only an identity claim: a fresh scan must
+          // resolve the same effective skill before any file is touched.
+          const skill = await resolveMutationSkill(name, path, DEFAULT_CWD(), res)
+          if (skill === undefined) return
           // Disabled = disable-model-invocation: true; enabled = false.
           const frontmatter = setFrontmatterField(skill.path, 'disable-model-invocation', enabled ? false : true)
           writeJson(res, 200, {
@@ -241,14 +261,18 @@ export function makeRoutes(deps: SkillRoutesDeps): WebRoute[] {
             writeJson(res, 400, { error: 'invalid JSON body' })
             return
           }
-          const { name } = body
-          if (typeof name !== 'string' || !NAME_PATTERN.test(name)) {
-            writeJson(res, 400, { error: 'expected { name }' })
+          const { name, path } = body
+          if (typeof name !== 'string' || !NAME_PATTERN.test(name) || typeof path !== 'string' || path.trim() === '') {
+            writeJson(res, 400, { error: 'expected { name, path }' })
             return
           }
-          const skill = await findSkill(name, DEFAULT_CWD())
-          if (skill === undefined || skill.path === undefined) {
-            writeJson(res, 404, { error: `skill ${name} has no deletable file (bundled/runtime skills cannot be deleted)` })
+          const skill = await resolveMutationSkill(name, path, DEFAULT_CWD(), res)
+          if (skill === undefined) return
+          // A linked skill lives behind a symlink (mount-of-intent content, not
+          // created under this root). Deleting it would move the target's real
+          // SKILL.md out of place, escaping this skill root — refuse deletion.
+          if (skill.linked === true) {
+            writeJson(res, 400, { error: `skill ${name} is a linked skill and cannot be deleted` })
             return
           }
           const moved = await trashSkillFile(skill.path)

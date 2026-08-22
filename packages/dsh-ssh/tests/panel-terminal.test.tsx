@@ -35,6 +35,19 @@ function fakeApi(): SshApi {
   } as unknown as SshApi
 }
 
+describe('TerminalTab L2 semantic attributes (#506)', () => {
+  it('tags the terminal container as the terminal part', async () => {
+    const container = document.createElement('div')
+    document.body.appendChild(container)
+    const root = createRoot(container)
+    await act(async () => { root.render(<TerminalTab api={fakeApi()} />) })
+    await act(async () => { await Promise.resolve() })
+    const terminal = container.querySelector('[data-dsh-part="terminal"]')
+    expect(terminal).not.toBeNull()
+    await act(async () => { root.unmount() })
+  })
+})
+
 describe('TerminalTab dispose and resize cleanup', () => {
   it('registers a resize listener on mount and removes it on unmount', async () => {
     const addResize = vi.fn()
@@ -60,6 +73,17 @@ describe('TerminalTab dispose and resize cleanup', () => {
     const source = readFileSync(join(process.cwd(), 'src', 'client', 'panel', 'TerminalTab.tsx'), 'utf8')
     expect(source).toContain('dataSubRef.current?.dispose()')
     expect(source).toContain('termRef.current?.dispose()')
-    expect(source).toContain('window.removeEventListener(\'resize\', onResize)')
+    expect(source).toContain('window.removeEventListener(\'resize\', sync)')
+  })
+
+  it('observes the terminal container so banner/panel resizes refit', () => {
+    // The connected banner shrinks the container after the initial fit;
+    // without a container-level observer the viewport keeps the old height
+    // and the last line is clipped. Guard the contract at source level
+    // (jsdom has no ResizeObserver to exercise at runtime).
+    const source = readFileSync(join(process.cwd(), 'src', 'client', 'panel', 'TerminalTab.tsx'), 'utf8')
+    expect(source).toContain('new ResizeObserver(')
+    expect(source).toContain('observer.observe(container)')
+    expect(source).toContain('observer.disconnect()')
   })
 })

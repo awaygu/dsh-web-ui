@@ -23,7 +23,9 @@ import { PairFailedNotice } from './PairFailedNotice.tsx'
 import { RemoteSettingsCard, RemoteSettingsCardController, type RemoteSettings } from './RemoteSettingsCard.tsx'
 import { en, zh, type RemoteKey } from './locales.ts'
 import { PAIR_FAILED_MARKER, runPairBootFlow } from './deep-link.ts'
-import { sendHeartbeat } from './pair-api.ts'
+import { readPairGatePolicy, sendHeartbeat } from './pair-api.ts'
+import { channelTransition, installRemoteChannel, isLoopbackHostname, remoteChannelRequired } from './remote-channel.ts'
+import { FenceNotice } from './FenceNotice.tsx'
 
 export type { RemoteEntryProps } from './RemoteEntry.tsx'
 export type { PanelState, RemotePanelProps } from './RemotePanel.tsx'
@@ -192,6 +194,75 @@ export function apply(ctx: ClientContext): void {
   }
   settingsScope.subscribe(syncRuntime)
   syncRuntime()
+
+  // Remote desktop channel: on a non-loopback origin (LAN address or public
+  // tunnel) the connection plugin's /api fence refuses this desktop Web GUI,
+  // and pairing is the access control — so the SDK client's /api traffic is
+  // rewritten onto this plugin's gated /remote/api prefix (remote-channel.ts)
+  // while the fence setting demands it. Loopback origins are untouched.
+  let disposeChannel: (() => void) | undefined
+  let hostPairingPolicy: boolean | undefined
+  let unpairedWhilePolicyPending = false
+  let fenceNotice: { unmount: () => void; node: HTMLElement } | undefined
+  const showFenceNotice = (): void => {
+    if (fenceNotice !== undefined) return
+    const node = document.createElement('div')
+    document.body.appendChild(node)
+    const root = createRoot(node)
+    root.render(createElement(FenceNotice, { t, onRetry: () => { window.location.reload() } }))
+    fenceNotice = { unmount: () => { root.unmount(); node.remove() }, node }
+  }
+  const hideFenceNotice = (): void => {
+    fenceNotice?.unmount()
+    fenceNotice = undefined
+  }
+  const handleUnpaired = (): void => {
+    if (settingsScope.getSnapshot().status !== 'ready' && hostPairingPolicy === undefined) {
+      unpairedWhilePolicyPending = true
+      return
+    }
+    showFenceNotice()
+  }
+  const channelActive = (): boolean => remoteChannelRequired(
+    window.location.hostname,
+    settingsScope.getSnapshot(),
+    hostPairingPolicy,
+  )
+  const syncChannel = (): void => {
+    const transition = channelTransition(channelActive(), disposeChannel !== undefined)
+    if (transition === 'install') {
+      disposeChannel = ctx.effect(() => {
+        const restore = installRemoteChannel(window, { onUnpaired: handleUnpaired, onPaired: hideFenceNotice })
+        return restore
+      }, 'remote-web-ui: remote desktop channel')
+    } else if (transition === 'retire' && disposeChannel !== undefined) {
+      disposeChannel()
+      disposeChannel = undefined
+      // Retire the notice with the channel: once requirePairingForLan turns
+      // off (or the plugin is disabled) the desktop rides plain /api again,
+      // so an unpaired notice raised while the channel was briefly active
+      // (the settings snapshot loads after boot) must not outlive it. The
+      // installed channel is the only path that raises the notice, so with
+      // the channel gone nothing can re-raise it (issue #808).
+      hideFenceNotice()
+    }
+  }
+  settingsScope.subscribe(syncChannel)
+  syncChannel()
+  if (!isLoopbackHostname(window.location.hostname) && settingsScope.getSnapshot().status !== 'ready') {
+    void readPairGatePolicy().then((policy) => {
+      hostPairingPolicy = policy.requirePairingForLan
+      syncChannel()
+      if (hostPairingPolicy && unpairedWhilePolicyPending) showFenceNotice()
+      unpairedWhilePolicyPending = false
+    }).catch(() => {
+      // Fail closed when the policy endpoint is unavailable or malformed.
+      hostPairingPolicy = true
+      syncChannel()
+      if (unpairedWhilePolicyPending) showFenceNotice()
+      unpairedWhilePolicyPending = false
+    })
+  }
 
   // One-time failed-pair toast. The accept result lands asynchronously, so
   // the marker check is deferred past the accept round trip.

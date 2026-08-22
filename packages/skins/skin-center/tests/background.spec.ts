@@ -12,6 +12,8 @@ import {
   BLUR_CONTENT_FIELD,
   BLUR_EMPTY_FIELD,
   SCRIM_VAR,
+  INPUT_CARD_BLUR_FIELD,
+  INPUT_CARD_BLUR_VAR,
 } from '../src/client/background.ts'
 
 /** Shape of the fake scope's section. */
@@ -20,6 +22,7 @@ interface Section {
   backgroundOpacity?: number
   backgroundBlurEmpty?: number
   backgroundBlurContent?: number
+  inputCardBlur?: number
 }
 
 /** A fake SettingsScope recording every set() call. */
@@ -81,13 +84,21 @@ function addConversationRow(): void {
   document.body.appendChild(pane)
 }
 
+function addOfficialConversationRow(): void {
+  const row = document.createElement('div')
+  row.setAttribute('data-chat-anchor-key', 'turn-1')
+  document.body.appendChild(row)
+}
+
 function removeConversationRow(): void {
   document.body.querySelectorAll('[data-pane="conversation"]').forEach(node => node.remove())
+  document.body.querySelectorAll('[data-chat-anchor-key]').forEach(node => node.remove())
 }
 
 describe('BackgroundController', () => {
   beforeEach(() => {
     document.body.innerHTML = ''
+    document.documentElement.removeAttribute('data-dsh-wallpaper-active')
   })
 
   it('defaults: no blur element and the occlusion var is still set', () => {
@@ -126,6 +137,16 @@ describe('BackgroundController', () => {
     removeConversationRow()
     await flush()
     expect(blurElement()!.style.backdropFilter).toContain('blur(2px)')
+    controller.dispose()
+  })
+
+  it('detects official shell message rows without the compat data-pane shim', async () => {
+    const { scope } = fakeScope({ backgroundBlurEmpty: 2, backgroundBlurContent: 10 })
+    const controller = new BackgroundController(scope)
+    expect(blurElement()!.style.backdropFilter).toContain('blur(2px)')
+    addOfficialConversationRow()
+    await flush()
+    expect(blurElement()!.style.backdropFilter).toContain('blur(10px)')
     controller.dispose()
   })
 
@@ -173,6 +194,21 @@ describe('BackgroundController', () => {
     controller.dispose()
   })
 
+  it('wallpaper active suppresses the background blur layer even with nonzero blur (#777 decouple)', () => {
+    document.documentElement.setAttribute('data-dsh-wallpaper-active', 'true')
+    const { scope } = fakeScope({ backgroundBlurEmpty: 6 })
+    const controller = new BackgroundController(scope)
+    expect(blurElement()).toBeNull()
+    controller.setBlurEmpty(10)
+    expect(blurElement()).toBeNull()
+    // Unmount wallpaper: the blur layer is allowed again on the next sync.
+    document.documentElement.removeAttribute('data-dsh-wallpaper-active')
+    controller.setBlurEmpty(10)
+    expect(blurElement()).not.toBeNull()
+    expect(blurElement()!.style.backdropFilter).toContain('blur(10px)')
+    controller.dispose()
+  })
+
   it('setEnabled(true) restores occlusion application', () => {
     const { scope } = fakeScope({ enabled: false, backgroundOpacity: 60 })
     const controller = new BackgroundController(scope)
@@ -181,6 +217,18 @@ describe('BackgroundController', () => {
     expect(controller.enabled()).toBe(true)
     expect(document.body.style.getPropertyValue(SCRIM_VAR)).toBe('0.6')
     controller.dispose()
+  })
+
+  it('applies, persists, and cleans up input-card blur', () => {
+    const { scope, calls } = fakeScope({ inputCardBlur: 6 })
+    const controller = new BackgroundController(scope)
+    expect(controller.inputCardBlur()).toBe(6)
+    expect(document.body.style.getPropertyValue(INPUT_CARD_BLUR_VAR)).toBe('6px')
+    controller.setInputCardBlur(99)
+    expect(controller.inputCardBlur()).toBe(20)
+    expect(calls).toContainEqual({ field: INPUT_CARD_BLUR_FIELD, value: 20 })
+    controller.dispose()
+    expect(document.body.style.getPropertyValue(INPUT_CARD_BLUR_VAR)).toBe('')
   })
 
   it('setEnabled persists via scope.set', () => {

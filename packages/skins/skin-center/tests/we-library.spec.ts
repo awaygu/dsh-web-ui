@@ -4,18 +4,23 @@
  * synthesis), the import store, and inventory update detection — all against
  * synthetic fixture trees in a temp dir; nothing real is ever touched.
  */
-import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
+import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import {
+  allLibrariesFromVdf,
   buildInventory,
   expandUser,
   inferType,
   librariesFromVdf,
+  libraryOwnsAppFromManifest,
+  locateWallpaperEngine,
+  owningLibraries,
   readImportedManifest,
   readProjectJson,
   scanImportStore,
+  scanManualWallpaperRoot,
   scanProjectsRoot,
 } from '../src/we-library.ts'
 
@@ -65,11 +70,49 @@ describe('librariesFromVdf', () => {
   })
 })
 
+describe('Steam library discovery', () => {
+  it('reads every VDF library and confirms stale-cache ownership from appmanifest', () => {
+    const fixtureExists = (path: string): boolean => path.startsWith(root) && existsSync(path)
+    const steam = join(root, 'steam')
+    const library = join(root, 'other-library')
+    mkdirSync(join(steam, 'steamapps'), { recursive: true })
+    mkdirSync(join(library, 'steamapps'), { recursive: true })
+    const vdf = [
+      '"libraryfolders"', '{', '  "1"', '  {',
+      `    "path" "${library.replace(/\\/g, '\\\\')}"`,
+      '    "apps"', '    {', '      "570" "1"', '    }', '  }', '}',
+    ].join('\n')
+    writeFileSync(join(steam, 'steamapps', 'libraryfolders.vdf'), vdf, 'utf8')
+    writeFileSync(join(library, 'steamapps', 'appmanifest_431960.acf'), '"appid" "431960"', 'utf8')
+
+    expect(allLibrariesFromVdf(vdf)).toEqual([library])
+    expect(libraryOwnsAppFromManifest(library, '431960')).toBe(true)
+    expect(owningLibraries({ exists: fixtureExists, registry: () => steam })).toEqual([library])
+  })
+
+  it('locates an install even when the VDF apps cache omits Wallpaper Engine', () => {
+    const fixtureExists = (path: string): boolean => path.startsWith(root) && existsSync(path)
+    const steam = join(root, 'steam')
+    const library = join(root, 'other-library')
+    const install = join(library, 'steamapps', 'common', 'wallpaper_engine')
+    mkdirSync(join(steam, 'steamapps'), { recursive: true })
+    mkdirSync(install, { recursive: true })
+    writeFileSync(join(install, 'wallpaper32.exe'), 'x', 'utf8')
+    writeFileSync(join(steam, 'steamapps', 'libraryfolders.vdf'), [
+      '"libraryfolders"', '{', '  "1"', '  {',
+      `    "path" "${library.replace(/\\/g, '\\\\')}"`,
+      '    "apps"', '    {', '    }', '  }', '}',
+    ].join('\n'), 'utf8')
+
+    expect(locateWallpaperEngine({ env: { OS: 'Windows_NT' }, exists: fixtureExists, registry: () => steam })).toBe(install)
+  })
+})
+
 describe('expandUser', () => {
   it('expands a leading tilde to the home directory and leaves other paths alone', () => {
-    const home = process.env.HOME ?? ''
+    const home = homedir()
     expect(expandUser('~')).toBe(home)
-    expect(expandUser('~/Movies/wallpapers')).toBe(home + '/Movies/wallpapers')
+    expect(expandUser('~/Movies/wallpapers')).toBe(join(home, 'Movies/wallpapers'))
     expect(expandUser('/abs/path')).toBe('/abs/path')
     expect(expandUser('relative/path')).toBe('relative/path')
     expect(expandUser('~user/x')).toBe('~user/x')
@@ -148,6 +191,24 @@ describe('scanProjectsRoot', () => {
   })
 })
 
+describe('scanManualWallpaperRoot', () => {
+  it('descends from a Wallpaper Engine install root into local and workshop projects', () => {
+    const library = join(root, 'SteamLibrary')
+    const install = join(library, 'steamapps', 'common', 'wallpaper_engine')
+    makeProject(join(install, 'projects', 'defaultprojects', 'local-one'), { title: 'Local', file: 'local.mp4' }, ['local.mp4'])
+    makeProject(join(library, 'steamapps', 'workshop', 'content', '431960', '123'), { title: 'Workshop', file: 'workshop.mp4' }, ['workshop.mp4'])
+
+    const entries = scanManualWallpaperRoot(install)
+    expect(entries.map(entry => entry.title).sort()).toEqual(['Local', 'Workshop'])
+  })
+
+  it('descends from a Steam library root into workshop content', () => {
+    const library = join(root, 'SteamLibrary')
+    makeProject(join(library, 'steamapps', 'workshop', 'content', '431960', '456'), { title: 'Library workshop', file: 'wall.mp4' }, ['wall.mp4'])
+    expect(scanManualWallpaperRoot(library).map(entry => entry.title)).toEqual(['Library workshop'])
+  })
+})
+
 describe('scanImportStore', () => {
   it('reads manifests into imported entries', () => {
     const store = join(root, 'store')
@@ -170,6 +231,44 @@ describe('scanImportStore', () => {
     const store = join(root, 'store')
     mkdirSync(join(store, 'junk'), { recursive: true })
     expect(scanImportStore(store)).toHaveLength(0)
+  })
+})
+
+describe('scene container resolution (#521)', () => {
+  it('falls back to scene.pkg when the declared scene.json is missing', () => {
+    const ws = join(root, 'workshop')
+    makeProject(join(ws, '444'), { title: 'S', type: 'scene', file: 'scene.json' }, ['scene.pkg'])
+    const entries = scanProjectsRoot(ws, 'workshop')
+    expect(entries).toHaveLength(1)
+    expect(entries[0].file).toBe('scene.pkg')
+    expect(entries[0].fileAbs).toBe(join(ws, '444', 'scene.pkg'))
+    expect(entries[0].srcSize).toBeGreaterThan(0)
+  })
+
+  it('keeps an existing declared file and probes a lone *.pkg last', () => {
+    const ws = join(root, 'workshop2')
+    makeProject(join(ws, '555'), { title: 'S', type: 'scene', file: 'scene.json' }, ['scene.json'])
+    expect(scanProjectsRoot(ws, 'workshop2')[0].file).toBe('scene.json')
+    const ws2 = join(root, 'workshop3')
+    makeProject(join(ws2, '666'), { title: 'S', type: 'scene', file: 'main.json' }, ['effect.pkg'])
+    expect(scanProjectsRoot(ws2, 'workshop3')[0].file).toBe('effect.pkg')
+  })
+
+  it('heals imported manifests that recorded the wrong declared name', () => {
+    const store = join(root, 'store')
+    const entryDir = join(store, '777')
+    mkdirSync(join(entryDir, 'project'), { recursive: true })
+    writeFileSync(join(entryDir, 'project', 'scene.pkg'), 'x', 'utf8')
+    writeFileSync(join(entryDir, 'manifest.json'), JSON.stringify({
+      sourceId: '777', title: 'Imported S', type: 'scene',
+      srcMtime: 10, srcSize: 1, importedAt: 20,
+      file: join('project', 'scene.json'), preview: null,
+    }), 'utf8')
+    const entries = scanImportStore(store)
+    expect(entries).toHaveLength(1)
+    expect(entries[0].file).toBe(join('project', 'scene.pkg'))
+    expect(entries[0].fileAbs).toBe(join(entryDir, 'project', 'scene.pkg'))
+    expect(entries[0].srcSize).toBeGreaterThan(0)
   })
 })
 

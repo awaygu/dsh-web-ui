@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-/** The update entry: trigger, check flow, auto-update, and outcome copy. */
+/** The update entry: trigger, check flow, the confirmed update (#507), and outcome copy. */
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import type { UpdateStatus } from '../src/update.ts'
@@ -107,17 +107,23 @@ describe("UpdateEntry", () => {
 
   it("opens the panel and reports up to date", async () => {
     const { fetch } = mount(upToDateStatus())
-    fireEvent.click(screen.getByRole('button', { name: /Check for updates$/ }))
+    const trigger = screen.getByRole('button', { name: /Check for updates$/ })
+    fireEvent.click(trigger)
     await waitFor(() => expect(fetch).toHaveBeenCalledWith("/api/update/status"))
+    expect(trigger.getAttribute('aria-expanded')).toBe('true')
     await waitFor(() => expect(screen.getByText('Everything is up to date')).toBeTruthy())
     expect(screen.getByText('@linxin666/dsh-web-ui-all')).toBeTruthy()
     // No update run for an up-to-date install.
     expect(fetch).not.toHaveBeenCalledWith("/api/update/run", expect.anything())
   })
 
-  it("auto-runs the update when a newer release exists and reports done", async () => {
+  it("never starts the update from the check alone and runs it on confirmation (#507)", async () => {
     const { fetch } = mount(outdatedStatus(), { ok: true, exitCode: 0, output: "Done" })
     fireEvent.click(screen.getByRole('button', { name: /Check for updates$/ }))
+    // The result view shows the new version and waits; no run is triggered.
+    await waitFor(() => expect(screen.getByText('A new version is available')).toBeTruthy())
+    expect(fetch).not.toHaveBeenCalledWith('/api/update/run', expect.anything())
+    fireEvent.click(screen.getByRole('button', { name: 'Update now' }))
     await waitFor(() => expect(fetch).toHaveBeenCalledWith('/api/update/run', expect.objectContaining({ method: 'POST' })))
     await waitFor(() => expect(screen.getByText('Update complete')).toBeTruthy())
     expect(screen.getByText(/Restart dsh web/)).toBeTruthy()
@@ -138,6 +144,7 @@ describe("UpdateEntry", () => {
 
     await waitFor(() => expect(screen.getByRole('button', { name: 'New version available. Check for updates' })).toBeTruthy())
     fireEvent.click(screen.getByRole('button', { name: /Check for updates$/ }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Update now' }))
     await waitFor(() => expect(fetch).toHaveBeenCalledWith('/api/update/run', expect.objectContaining({ method: 'POST' })))
     fireEvent.click(screen.getByRole('button', { name: 'Close update panel' }))
     update.resolve(new Response(JSON.stringify({ ok: true, exitCode: 0, output: '' }), { status: 200, headers: { 'content-type': 'application/json' } }))
@@ -151,6 +158,7 @@ describe("UpdateEntry", () => {
   it("shows the failure output when pnpm fails", async () => {
     const { fetch } = mount(outdatedStatus(), { ok: false, exitCode: 1, output: "ERR! failed", errorCode: "pnpm-failed" })
     fireEvent.click(screen.getByRole('button', { name: /Check for updates$/ }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Update now' }))
     await waitFor(() => expect(fetch).toHaveBeenCalledWith('/api/update/run', expect.anything()))
     await waitFor(() => expect(screen.getByText(/exited with code 1/)).toBeTruthy())
     expect(screen.getByText('ERR! failed')).toBeTruthy()

@@ -15,6 +15,7 @@ import type { BranchesView, GraphView, RepoStatus, SwitchResult } from '../src/c
 import type { GitGraphInjected } from '../src/client/index.ts'
 import type { BranchChipProps } from '../src/client/chips/BranchChip.tsx'
 import { BranchChip } from '../src/client/chips/BranchChip.tsx'
+import { GraphDialog } from '../src/client/graph/GraphDialog.tsx'
 import { zh, type GitGraphKey } from '../src/client/locales.ts'
 import css from '../src/client/chips/context.module.css'
 
@@ -163,6 +164,14 @@ describe('BranchChip', () => {
     bench()
     const branchChip = await screen.findByRole('button', { name: '分支' })
     expect(branchChip.textContent).toContain('main')
+  })
+
+  it('opts the chip anchor into the L2 semantic attributes (#506)', async () => {
+    bench()
+    const branchChip = await screen.findByRole('button', { name: '分支' })
+    const anchor = anchorOf(branchChip)
+    expect(anchor.getAttribute('data-dsh-plugin')).toBe('git-graph')
+    expect(anchor.getAttribute('data-dsh-part')).toBe('chip')
   })
 
   it('marks only the unskinned light skin-center page for stock-light fallback styles', async () => {
@@ -417,5 +426,69 @@ describe('BranchChip', () => {
     } finally {
       vi.useRealTimers()
     }
+  })
+})
+
+describe('GraphDialog', () => {
+  it('opts the dialog into the L2 semantic attributes (#506)', async () => {
+    render(
+      <GraphDialog
+        graph={async () => ({
+          root: '/ws/proj', branch: 'main',
+          commits: [
+            { oid: 'aabbcc', parents: [], subject: 'root commit', author: 'Bob', authorTime: 1690000000, refs: [] },
+          ],
+          hasMore: false,
+        })}
+        onClose={() => {}}
+        t={makeTranslate()}
+      />,
+    )
+    const dialog = await screen.findByRole('dialog', { name: 'Git 图谱' })
+    expect(dialog.getAttribute('data-gitgraph-dialog')).not.toBeNull()
+    expect(dialog.getAttribute('data-dsh-plugin')).toBe('git-graph')
+    expect(dialog.getAttribute('data-dsh-part')).toBe('dialog')
+    expect(await screen.findByText('root commit')).toBeTruthy()
+  })
+
+  it('does not re-run the initial load when the graph prop identity changes', async () => {
+    const calls: number[] = []
+    const graph = async (limit?: number) => {
+      calls.push(limit ?? 0)
+      return {
+        root: '/ws/proj', branch: 'main',
+        commits: [
+          { oid: 'aabbcc', parents: [], subject: 'root commit', author: 'Bob', authorTime: 1690000000, refs: [] },
+        ],
+        hasMore: false,
+      }
+    }
+    const { rerender } = render(
+      <GraphDialog graph={graph} onClose={() => {}} t={makeTranslate()} />,
+    )
+    await screen.findByText('root commit')
+    const callsAfterMount = calls.length
+    // The initial load ran with the page size.
+    expect(calls).toEqual([200])
+
+    // A parent re-render passes a fresh inline arrow → graph identity changes.
+    rerender(
+      <GraphDialog
+        graph={async (limit?: number) => {
+          calls.push(limit ?? 0)
+          return {
+            root: '/ws/proj', branch: 'main',
+            commits: [
+              { oid: 'aabbcc', parents: [], subject: 'root commit', author: 'Bob', authorTime: 1690000000, refs: [] },
+            ],
+            hasMore: false,
+          }
+        }}
+        onClose={() => {}}
+        t={makeTranslate()}
+      />,
+    )
+    // No new initial fetch: the effect is mount-only.
+    expect(calls.length).toBe(callsAfterMount)
   })
 })

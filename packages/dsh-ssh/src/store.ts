@@ -1,5 +1,6 @@
 /**
- * Host config store: one JSON file (`~/.dsh/dsh-ssh.json`) holding every
+ * Host config store: one JSON file (`$DSH_HOME/dsh-ssh.json`, defaulting
+ * to `~/.dsh`) holding every
  * SSH host entry, written atomically (tmp + rename). Also parses the user's
  * standard `~/.ssh/config` for one-shot import. Secrets (passwords,
  * passphrases) live in this user-owned file in plaintext — same trust model
@@ -9,14 +10,15 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
+import { dshHome } from './dsh-home.ts'
 import type { HostPayload, ImportResult, SshHostEntry, SshHostSummary } from './protocol.ts'
 
 /** File format version. */
 const FORMAT_VERSION = 1
 
-/** Store file location: <home>/.dsh/dsh-ssh.json. */
+/** Store file location: $DSH_HOME/dsh-ssh.json (defaults to ~/.dsh). */
 export function storePath(): string {
-  return join(homedir(), '.dsh', 'dsh-ssh.json')
+  return join(dshHome(), 'dsh-ssh.json')
 }
 
 /** The user's standard OpenSSH config path. */
@@ -38,12 +40,15 @@ export function validateHostPayload(payload: unknown): string | undefined {
   const auth = p.auth as Record<string, unknown> | undefined
   if (auth !== undefined) {
     if (typeof auth !== 'object' || auth === null) return 'auth must be an object'
-    if (auth.kind !== 'key' && auth.kind !== 'password') return 'auth.kind must be key or password'
+    if (auth.kind !== 'key' && auth.kind !== 'password' && auth.kind !== 'agent') return 'auth.kind must be key, password or agent'
     if (auth.kind === 'key' && (typeof auth.keyPath !== 'string' || auth.keyPath.trim() === '')) {
       return 'auth.keyPath is required for key auth'
     }
     if (auth.kind === 'password' && auth.password !== undefined && typeof auth.password !== 'string') {
       return 'auth.password must be a string when provided'
+    }
+    if (auth.kind === 'agent' && auth.agentPath !== undefined && typeof auth.agentPath !== 'string') {
+      return 'auth.agentPath must be a string when provided'
     }
   }
   if (p.port !== undefined && (typeof p.port !== 'number' || !Number.isInteger(p.port) || p.port < 1 || p.port > 65535)) {
@@ -101,6 +106,8 @@ export class HostStore {
     let keyReady = true
     if (entry.auth.kind === 'key' && entry.auth.keyPath) {
       keyReady = existsSync(expandHome(entry.auth.keyPath))
+    } else if (entry.auth.kind === 'agent') {
+      keyReady = false
     }
     return {
       alias: entry.alias,
@@ -143,6 +150,7 @@ export class HostStore {
         keyPath: payload.auth.kind === 'key' ? expandHome(payload.auth.keyPath?.trim() ?? '') : undefined,
         passphrase: payload.auth.kind === 'key' ? payload.auth.passphrase ?? undefined : undefined,
         password: payload.auth.kind === 'password' ? payload.auth.password : undefined,
+        agentPath: payload.auth.kind === 'agent' ? normalizeAgentPath(payload.auth.agentPath) : undefined,
       },
       proxyJump: [...(payload.proxyJump ?? [])],
       description: payload.description?.trim() || undefined,
@@ -184,12 +192,15 @@ export class HostStore {
     if (patch.user !== undefined) entry.user = patch.user.trim()
     if (patch.auth !== undefined) {
       const auth = patch.auth
-      if (auth.kind !== 'key' && auth.kind !== 'password') throw new Error('auth.kind must be key or password')
+      if (auth.kind !== 'key' && auth.kind !== 'password' && auth.kind !== 'agent') throw new Error('auth.kind must be key, password or agent')
       if (auth.kind === 'key' && (typeof auth.keyPath !== 'string' || auth.keyPath.trim() === '')) {
         throw new Error('auth.keyPath is required for key auth')
       }
       if (auth.kind === 'password' && auth.password !== undefined && typeof auth.password !== 'string') {
         throw new Error('auth.password must be a string when provided')
+      }
+      if (auth.kind === 'agent' && auth.agentPath !== undefined && typeof auth.agentPath !== 'string') {
+        throw new Error('auth.agentPath must be a string when provided')
       }
       // A changed key path with no passphrase means the new key has none;
       // only keep the old passphrase when the key path is unchanged.
@@ -203,6 +214,9 @@ export class HostStore {
           ? (auth.passphrase !== undefined ? auth.passphrase : (keyChanged ? undefined : entry.auth.passphrase))
           : undefined,
         password: auth.kind === 'password' ? auth.password : undefined,
+        agentPath: auth.kind === 'agent'
+          ? (auth.agentPath !== undefined ? normalizeAgentPath(auth.agentPath) : entry.auth.agentPath)
+          : undefined,
       }
     }
     if (patch.proxyJump !== undefined) entry.proxyJump = [...patch.proxyJump]
@@ -281,9 +295,16 @@ export class HostStore {
         port: block.props.port !== undefined ? Number.parseInt(block.props.port, 10) : 22,
         user: block.props.user ?? process.env.USER ?? 'root',
         auth: {
-          kind: block.props.identityfile !== undefined ? 'key' : 'password',
+          kind: block.props.identityfile !== undefined
+            ? 'key'
+            : block.props.identityagent !== undefined && block.props.identityagent.toLowerCase() !== 'none'
+              ? 'agent'
+              : 'password',
           keyPath: block.props.identityfile,
           password: block.props.password,
+          agentPath: block.props.identityagent !== undefined && block.props.identityagent.toLowerCase() !== 'none'
+            ? normalizeAgentPath(block.props.identityagent)
+            : undefined,
         },
         proxyJump: block.props.proxyjump !== undefined
           ? block.props.proxyjump.split(',').map(hop => hop.trim()).filter(hop => hop !== '')
@@ -353,6 +374,17 @@ export class HostStore {
     renameSync(tmp, this.path)
     this.cache = undefined
   }
+}
+
+/** Normalize an agent endpoint for storage: trim, expand `~`, and resolve the SSH_AUTH_SOCK token. */
+export function normalizeAgentPath(agentPath: string | undefined): string | undefined {
+  const trimmed = agentPath?.trim()
+  if (trimmed === undefined || trimmed === '') return undefined
+  if (trimmed === 'SSH_AUTH_SOCK' || trimmed === '$SSH_AUTH_SOCK') {
+    const sock = process.env.SSH_AUTH_SOCK
+    return sock !== undefined && sock !== '' ? sock : undefined
+  }
+  return expandHome(trimmed)
 }
 
 /** Expand a leading `~` in a filesystem path. */

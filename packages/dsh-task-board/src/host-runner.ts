@@ -1,4 +1,5 @@
 import type { ApiProxy, RpcId } from '@deepseek-ai/dsh-host-apiproxy'
+import type { CommandResult } from '@deepseek-ai/dsh-commands/types'
 import type { TaskRecord } from './core/tasks.ts'
 
 function request<T>(payload: T) {
@@ -7,6 +8,25 @@ function request<T>(payload: T) {
 
 function failure(error: { code: string; message: string }): Error {
   return new Error(`${error.code}: ${error.message}`)
+}
+
+/** One session-list row, extracted from the sessions.list RPC result. */
+export type SessionSummary = Extract<
+  Awaited<ReturnType<ApiProxy['sessions']['list']>>['result'],
+  { ok: true }
+>['value']['items'][number]
+
+type ExecutionSessionId = Extract<
+  Awaited<ReturnType<ApiProxy['sessions']['create']>>['result'],
+  { ok: true }
+>['value']['sessionId']
+
+export interface SessionCommandDispatcher {
+  execute(
+    sessionId: ExecutionSessionId,
+    line: string,
+    signal: AbortSignal,
+  ): Promise<CommandResult | undefined>
 }
 
 export type ExecutionInspection =
@@ -30,7 +50,10 @@ function isErrorTurnEnd(data: unknown): boolean {
 }
 
 export class HostExecutionRunner {
-  constructor(private readonly api: ApiProxy) {}
+  constructor(
+    private readonly api: ApiProxy,
+    private readonly commands?: SessionCommandDispatcher,
+  ) {}
 
   async launch(task: TaskRecord): Promise<string> {
     if (task.workspaceId !== undefined) {
@@ -57,13 +80,10 @@ export class HostExecutionRunner {
       const renamed = await this.api.sessions.rename(request({ sessionId, title: task.title }))
       if (!renamed.result.ok) throw failure(renamed.result.error)
       if (task.permission !== undefined) {
-        const command = await this.api.sessions.prompt(request({
-          sessionId,
-          mode: 'queue' as const,
-          content: [{ type: 'text' as const, text: `/permission ${task.permission}` }],
-        }))
-        if (!command.result.ok) throw failure(command.result.error)
-        if (command.result.value.command?.kind !== 'success') throw new Error('permission command was not acknowledged')
+        if (this.commands === undefined) throw new Error('permission command dispatcher is unavailable')
+        const command = await this.commands.execute(sessionId, `/permission ${task.permission}`, AbortSignal.timeout(30_000))
+        if (command === undefined) throw new Error('permission command was not acknowledged')
+        if (command.kind !== 'success') throw new Error(command.text ?? 'permission command failed')
       }
       const prompt = await this.api.sessions.prompt(request({
         sessionId,
@@ -77,21 +97,33 @@ export class HostExecutionRunner {
     return sessionId
   }
 
-  async listRunning(): Promise<{ known: true; count: number } | { known: false }> {
+  async listRunning(): Promise<{ known: true; count: number; items: SessionSummary[] } | { known: false }> {
     try {
       const response = await this.api.sessions.list(request({}))
       return response.result.ok
-        ? { known: true, count: response.result.value.items.filter(item => item.running).length }
+        ? { known: true, count: response.result.value.items.filter(item => item.running).length, items: response.result.value.items }
         : { known: false }
     } catch {
       return { known: false }
     }
   }
 
-  async inspect(sessionId: string, startedAt = 0): Promise<ExecutionInspection> {
-    const sessions = await this.api.sessions.list(request({}))
-    if (!sessions.result.ok) return { outcome: 'pending' }
-    const summary = sessions.result.value.items.find(item => item.sessionId === sessionId)
+  /**
+   * Resolve one execution's outcome. The caller may pass the session list it
+   * already fetched this poll tick; otherwise inspect lists sessions itself.
+   * Sharing the list keeps a poll with E open executions at one list RPC
+   * instead of 1 + E.
+   */
+  async inspect(sessionId: string, startedAt = 0, sessions?: readonly SessionSummary[]): Promise<ExecutionInspection> {
+    let items: readonly SessionSummary[]
+    if (sessions !== undefined) {
+      items = sessions
+    } else {
+      const response = await this.api.sessions.list(request({}))
+      if (!response.result.ok) return { outcome: 'pending' }
+      items = response.result.value.items
+    }
+    const summary = items.find(item => item.sessionId === sessionId)
     if (summary === undefined) return { outcome: 'cancelled', error: 'execution session no longer exists' }
     if (summary.running) return { outcome: 'pending' }
     const events: Array<{ event: { type: string; seq?: number; time?: number; data: unknown } }> = []

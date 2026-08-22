@@ -29,7 +29,7 @@
 import { execFileSync } from 'node:child_process'
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { basename, join as joinPath, resolve as resolvePath } from 'node:path'
+import { basename, dirname, join as joinPath, resolve as resolvePath } from 'node:path'
 
 /** Steam appid of Wallpaper Engine. */
 export const WE_APPID = '431960'
@@ -136,7 +136,7 @@ function firstNonBlank(...values: Array<string | undefined>): string | undefined
  * @param run - reg.exe runner (defaults to execFileSync).
  */
 export function steamPathFromRegistry(
-  run: (args: string[]) => string = (args) => execFileSync(
+  run: () => string = () => execFileSync(
     joinPath(process.env.SystemRoot || 'C:\\Windows', 'System32', 'reg.exe'),
     ['query', 'HKCU\\Software\\Valve\\Steam', '/v', 'SteamPath'],
     { encoding: 'utf8', windowsHide: true, timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] },
@@ -144,7 +144,7 @@ export function steamPathFromRegistry(
 ): string | null {
   if (process.platform !== 'win32') return null
   try {
-    const match = /SteamPath\s+REG_SZ\s+(.+)/i.exec(run([]))
+    const match = /SteamPath\s+REG_SZ\s+(.+)/i.exec(run())
     return match ? match[1].trim() : null
   } catch {
     return null
@@ -166,6 +166,27 @@ export function librariesFromVdf(vdfText: string): string[] {
     }
   }
   return libraries
+}
+
+/** Every Steam library root listed in libraryfolders.vdf, independent of its stale apps cache. */
+export function allLibrariesFromVdf(vdfText: string): string[] {
+  const libraries: string[] = []
+  for (const line of vdfText.split(/\r?\n/)) {
+    const match = /^\s*"path"\s+"([^"]+)"\s*$/.exec(line)
+    if (match === null) continue
+    const root = match[1].replace(/\\\\/g, '\\')
+    if (!libraries.includes(root)) libraries.push(root)
+  }
+  return libraries
+}
+
+/** Durable ownership fact used when libraryfolders.vdf has not refreshed its apps block. */
+export function libraryOwnsAppFromManifest(
+  library: string,
+  appid: string,
+  exists: (path: string) => boolean = existsSync,
+): boolean {
+  return exists(joinPath(library, 'steamapps', `appmanifest_${appid}.acf`))
 }
 
 /**
@@ -191,7 +212,7 @@ export function locateWallpaperEngine(opts: {
       const vdf = joinPath(probe, 'steamapps', 'libraryfolders.vdf')
       if (exists(vdf)) {
         try {
-          libraries.push(...librariesFromVdf(readFileSync(vdf, 'utf8')))
+          libraries.push(...allLibrariesFromVdf(readFileSync(vdf, 'utf8')))
         } catch {
           // Unreadable vdf: skip this probe.
         }
@@ -221,18 +242,22 @@ export function owningLibraries(opts: {
   if (process.platform !== 'win32' && !opts.exists) return []
   const registry = opts.registry ?? (() => steamPathFromRegistry())
   const probes = [...new Set([registry(), ...STEAM_PROBE_DIRS].filter((d): d is string => !!d))]
-  const libraries: string[] = []
+  const libraries = new Set<string>()
   for (const probe of probes) {
     const vdf = joinPath(probe, 'steamapps', 'libraryfolders.vdf')
-    if (exists(vdf)) {
-      try {
-        libraries.push(...librariesFromVdf(readFileSync(vdf, 'utf8')))
-      } catch {
-        // Skip.
-      }
+    if (!exists(vdf)) continue
+    let vdfText: string
+    try {
+      vdfText = readFileSync(vdf, 'utf8')
+    } catch {
+      continue
+    }
+    for (const root of librariesFromVdf(vdfText)) libraries.add(root)
+    for (const root of allLibrariesFromVdf(vdfText)) {
+      if (libraryOwnsAppFromManifest(root, WE_APPID, exists)) libraries.add(root)
     }
   }
-  return [...new Set(libraries)]
+  return [...libraries]
 }
 
 /** Infer the wallpaper type from the main file extension (project.json fallback). */
@@ -305,9 +330,38 @@ function synthesizeMediaEntries(dir: string, source: WallpaperSource): Wallpaper
   return entries
 }
 
+/**
+ * Resolve a scene project's real main container. project.json's file field
+ * is trusted when it exists on disk, but workshop items frequently declare
+ * `scene.json` while shipping only the packed `scene.pkg` (and loose
+ * projects ship the reverse) — probe the declared file, then scene.pkg,
+ * then scene.json, then a single *.pkg in the directory (#521). Returns the
+ * hit relative to dir, or null when nothing matches.
+ */
+export function resolveSceneMainFile(dir: string, declared: string): string | null {
+  for (const candidate of [declared, 'scene.pkg', 'scene.json']) {
+    if (candidate === '') continue
+    try {
+      if (statSync(resolvePath(dir, candidate)).isFile()) return candidate
+    } catch {
+      // keep probing
+    }
+  }
+  let pkgs: string[] = []
+  try {
+    pkgs = readdirSync(dir).filter((name) => name.toLowerCase().endsWith('.pkg'))
+  } catch {
+    return null
+  }
+  return pkgs.length === 1 ? pkgs[0] : null
+}
+
 /** Build one entry from a project directory. */
 function entryFromDir(dir: string, source: WallpaperSource, project: ProjectJson, id?: string): WallpaperEntry {
-  const fileAbs = resolvePath(dir, project.file)
+  // A scene project's declared file is only a hint (#521); resolve the
+  // container that actually exists so frameUrl, stats and imports follow it.
+  const file = project.type === 'scene' ? resolveSceneMainFile(dir, project.file) ?? project.file : project.file
+  const fileAbs = resolvePath(dir, file)
   const previewAbs = project.preview ? resolvePath(dir, project.preview) : null
   let mtime = 0
   let size = 0
@@ -326,7 +380,7 @@ function entryFromDir(dir: string, source: WallpaperSource, project: ProjectJson
     id: id ?? basename(dir),
     title: project.title ?? basename(dir),
     type: project.type,
-    file: project.file,
+    file,
     preview: project.preview,
     dir,
     fileAbs,
@@ -374,6 +428,35 @@ export function scanProjectsRoot(root: string, source: WallpaperSource): Wallpap
   return entries
 }
 
+/**
+ * Scan a user-supplied path at any supported Wallpaper Engine level: a
+ * project folder, project collection, WE install root, Steam library root,
+ * steamapps folder, or workshop content root.
+ */
+export function scanManualWallpaperRoot(root: string): WallpaperEntry[] {
+  const candidates: Array<{ root: string; source: WallpaperSource }> = [
+    { root, source: 'local' },
+    { root: joinPath(root, 'projects', 'defaultprojects'), source: 'local' },
+    { root: joinPath(root, 'projects', 'myprojects'), source: 'local' },
+    { root: joinPath(root, 'steamapps', 'workshop', 'content', WE_APPID), source: 'workshop' },
+    { root: joinPath(root, 'workshop', 'content', WE_APPID), source: 'workshop' },
+  ]
+  if (basename(root).toLowerCase() === 'wallpaper_engine') {
+    candidates.push({
+      root: joinPath(dirname(dirname(root)), 'workshop', 'content', WE_APPID),
+      source: 'workshop',
+    })
+  }
+  const found = new Map<string, WallpaperEntry>()
+  for (const candidate of candidates) {
+    if (!existsSync(candidate.root)) continue
+    for (const entry of scanProjectsRoot(candidate.root, candidate.source)) {
+      if (!found.has(entry.id)) found.set(entry.id, entry)
+    }
+  }
+  return [...found.values()]
+}
+
 /** Read one import-store entry's manifest.json; null when absent/invalid. */
 export function readImportedManifest(entryDir: string): ImportedManifest | null {
   const path = joinPath(entryDir, 'manifest.json')
@@ -418,7 +501,13 @@ export function scanImportStore(storeDir: string): WallpaperEntry[] {
     const manifest = readImportedManifest(dir)
     if (!manifest) continue
     const projectDir = joinPath(dir, 'project')
-    const fileAbs = resolvePath(dir, manifest.file)
+    // Heal manifests written from a wrong declared scene file (#521):
+    // re-resolve the container inside the copied project directory.
+    const declaredRel = manifest.file.replace(/^project[\\/]/, '')
+    const file = manifest.type === 'scene'
+      ? joinPath('project', resolveSceneMainFile(projectDir, declaredRel) ?? declaredRel)
+      : manifest.file
+    const fileAbs = resolvePath(dir, file)
     const previewAbs = manifest.preview ? resolvePath(dir, manifest.preview) : null
     let mtime = 0
     let size = 0
@@ -440,7 +529,7 @@ export function scanImportStore(storeDir: string): WallpaperEntry[] {
       id: `imported/${manifest.sourceId}`,
       title: manifest.title,
       type: manifest.type,
-      file: manifest.file,
+      file,
       preview: manifest.preview,
       dir: projectDir,
       fileAbs,
@@ -496,7 +585,7 @@ export function buildInventory(opts: {
   for (const manual of opts.manualDirs ?? []) {
     const trimmed = firstNonBlank(manual)
     const dir = trimmed !== undefined ? expandUser(trimmed) : undefined
-    if (dir !== undefined && existsSync(dir)) for (const entry of scanProjectsRoot(dir, 'local')) add(entry)
+    if (dir !== undefined && existsSync(dir)) for (const entry of scanManualWallpaperRoot(dir)) add(entry)
   }
 
   const imported = opts.storeDir ? scanImportStore(opts.storeDir) : []

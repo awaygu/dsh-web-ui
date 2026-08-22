@@ -6,7 +6,7 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { Client, type ConnectConfig } from 'ssh2'
 import type { ExecResult, SshHostEntry } from '../protocol.ts'
-import { expandHome, type HostStore } from '../store.ts'
+import { expandHome, normalizeAgentPath, type HostStore } from '../store.ts'
 
 /** Default engine knobs. */
 export interface EngineOptions {
@@ -74,6 +74,12 @@ export function buildConnectConfig(entry: SshHostEntry, sock: ConnectConfig['soc
   if (sock !== undefined) config.sock = sock
   if (entry.auth.kind === 'password') {
     config.password = entry.auth.password
+  } else if (entry.auth.kind === 'agent') {
+    const agentPath = resolveAgentPath(entry.auth.agentPath)
+    if (agentPath === undefined) {
+      throw new Error('ssh-agent is not available: set SSH_AUTH_SOCK or configure an agent path (use \'pageant\' for PuTTY Pageant on Windows)')
+    }
+    config.agent = agentPath
   } else {
     const keyPath = entry.auth.keyPath === undefined ? undefined : expandHome(entry.auth.keyPath)
     if (keyPath === undefined || !existsSync(keyPath)) {
@@ -85,6 +91,16 @@ export function buildConnectConfig(entry: SshHostEntry, sock: ConnectConfig['soc
     }
   }
   return config
+}
+
+/** Resolve the ssh2 agent path for 'agent' auth. */
+export function resolveAgentPath(agentPath?: string): string | undefined {
+  const explicit = normalizeAgentPath(agentPath)
+  if (explicit !== undefined) return explicit
+  const sock = process.env.SSH_AUTH_SOCK
+  if (sock !== undefined && sock !== '') return sock
+  if (process.platform === 'win32') return 'pageant'
+  return undefined
 }
 
 /** Connect one ssh2 client (resolve on ready, reject on error/close). */
@@ -140,28 +156,34 @@ export async function connectChain(engine: PoolEngine, entry: SshHostEntry): Pro
   const hops: Client[] = []
   let sock: ConnectConfig['sock']
   const chain = entry.proxyJump
-  for (let index = 0; index < chain.length; index += 1) {
-    const hopAlias = chain[index]
-    const hop = engine.store.find(hopAlias)
-    if (hop === undefined) {
-      for (const client of hops) client.end()
-      throw new Error('proxyJump alias \'' + hopAlias + '\' not found — create it first')
-    }
-    const hopClient = await connectClient(buildConnectConfig(hop, sock, engine.opts))
-    hops.push(hopClient)
-    const next = index + 1 < chain.length ? engine.store.find(chain[index + 1]) : undefined
-    const nextHost = next !== undefined ? next.host : entry.host
-    const nextPort = next !== undefined ? next.port : entry.port
-    sock = await new Promise<ConnectConfig['sock']>((resolve, reject) => {
-      hopClient.forwardOut('127.0.0.1', 0, nextHost, nextPort, (error, stream) => {
-        if (error !== undefined) {
-          for (const client of hops) client.end()
-          reject(error)
-        } else {
-          resolve(stream)
-        }
+  try {
+    for (let index = 0; index < chain.length; index += 1) {
+      const hopAlias = chain[index]
+      const hop = engine.store.find(hopAlias)
+      if (hop === undefined) {
+        throw new Error('proxyJump alias \'' + hopAlias + '\' not found — create it first')
+      }
+      const hopClient = await connectClient(buildConnectConfig(hop, sock, engine.opts))
+      hops.push(hopClient)
+      const next = index + 1 < chain.length ? engine.store.find(chain[index + 1]) : undefined
+      const nextHost = next !== undefined ? next.host : entry.host
+      const nextPort = next !== undefined ? next.port : entry.port
+      sock = await new Promise<ConnectConfig['sock']>((resolve, reject) => {
+        hopClient.forwardOut('127.0.0.1', 0, nextHost, nextPort, (error, stream) => {
+          if (error !== undefined) {
+            reject(error)
+          } else {
+            resolve(stream)
+          }
+        })
       })
-    })
+    }
+  } catch (error) {
+    // A missing alias, a failed hop connect, or a failed forwardOut must all
+    // close the hops already connected, so a failed ProxyJump never leaks a
+    // middle-hop connection.
+    for (const client of hops) client.end()
+    throw error
   }
   let target: Client | undefined
   try {

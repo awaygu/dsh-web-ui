@@ -1,5 +1,6 @@
+import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { chmodSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { dshHome } from './dsh-home.ts'
 import { isValidCron, nextRunAtMs } from './core/schedule.ts'
@@ -58,14 +59,141 @@ function hasOpenExecution(task: TaskRecord): boolean {
   return task.executions.some(execution => execution.endedAt === undefined)
 }
 
-function processIsAlive(pid: number): boolean {
+/**
+ * Process states that are dead but still occupy the PID table: `Z` (zombie)
+ * and `X` (dead, being reaped). `process.kill(pid, 0)` reports such PIDs as
+ * alive, so a crash leftover whose child was never reaped would otherwise be
+ * mistaken for a live owner and block ledger startup forever.
+ */
+const DEAD_STATES = new Set(['Z', 'X'])
+
+/**
+ * Best-effort single-letter process state ('R','S','D','Z',...) or undefined
+ * when no probe is available on this platform. Linux reads /proc/<pid>/stat
+ * directly (no subprocess); other POSIX shells out to `ps -o stat=`; Windows
+ * has no zombie state, so it returns undefined and the kill(0) probe alone
+ * is authoritative there.
+ */
+export function processState(pid: number): string | undefined {
+  if (process.platform === 'linux') {
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, 'utf8')
+      const end = stat.lastIndexOf(')')
+      if (end === -1) return undefined
+      return stat.slice(end + 2).split(' ')[0] || undefined
+    } catch {
+      return undefined // no such process (or unreadable)
+    }
+  }
+  if (process.platform === 'win32') return undefined
+  try {
+    const probe = spawnSync('ps', ['-o', 'stat=', '-p', String(pid)], { timeout: PROCESS_PROBE_TIMEOUT_MS })
+    if (probe.status !== 0 || probe.stdout.length === 0) return undefined
+    const state = probe.stdout.toString('utf8').trim()
+    return state.length > 0 ? state[0] : undefined
+  } catch {
+    return undefined
+  }
+}
+
+export function processIsAlive(pid: number): boolean {
   if (!Number.isSafeInteger(pid) || pid <= 0) return false
+  const state = processState(pid)
+  if (state !== undefined && DEAD_STATES.has(state)) return false
   try {
     process.kill(pid, 0)
     return true
   } catch (error) {
     return (error as NodeJS.ErrnoException).code !== 'ESRCH'
   }
+}
+
+const PROCESS_PROBE_TIMEOUT_MS = 3000
+
+let ownStartTime: number | undefined
+let ownStartTimeResolved = false
+
+/**
+ * Exact process start time (Unix epoch ms) on Linux, read straight from
+ * /proc (field 22 = start ticks since boot, btime = boot epoch seconds).
+ * No subprocess and no rounding, so the recorded `startedAt` from a previous
+ * boot compares exactly against the live process identity.
+ */
+function linuxStartTimeMs(pid: number): number | undefined {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8')
+    const end = stat.lastIndexOf(')')
+    if (end === -1) return undefined
+    const ticks = Number(stat.slice(end + 2).split(' ')[19])
+    if (!Number.isFinite(ticks)) return undefined
+    const bootMatch = /^btime\s+(\d+)/m.exec(readFileSync('/proc/stat', 'utf8'))
+    if (bootMatch === null) return undefined
+    const btime = Number(bootMatch[1])
+    if (!Number.isFinite(btime)) return undefined
+    return btime * 1000 + (ticks * 1000) / 100 // USER_HZ is 100 on Linux
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Best-effort start time (Unix epoch ms) of a live process. Used to prove
+ * whether the ledger lock really belongs to the PID recorded in it, so a
+ * crash leftover whose PID was reused by an unrelated process (issue #786)
+ * is detected as stale instead of blocking startup forever. Returns
+ * undefined when the platform probe is unavailable; callers fail closed.
+ */
+function processStartTimeMs(pid: number): number | undefined {
+  if (process.platform === 'linux') return linuxStartTimeMs(pid)
+  if (process.platform === 'win32') {
+    const probe = spawnSync(
+      'powershell',
+      ['-NoProfile', '-NonInteractive', '-Command',
+        '[DateTimeOffset]::FromFileTime((Get-Process -Id ' + String(pid) + ' -ErrorAction SilentlyContinue).StartTime.ToUniversalTime().ToFileTime()).ToUnixTimeMilliseconds()'],
+      { timeout: PROCESS_PROBE_TIMEOUT_MS, windowsHide: true },
+    )
+    if (probe.status !== 0 || probe.stdout.length === 0) return undefined
+    const started = Number(probe.stdout.toString('utf8').trim())
+    return Number.isFinite(started) ? started : undefined
+  }
+  // Other POSIX (macOS...): ps lstart with a forced English locale, falling
+  // back to the elapsed-seconds column when lstart cannot be parsed.
+  const env = { ...process.env, LC_ALL: 'C' }
+  const probe = spawnSync('ps', ['-o', 'lstart=', '-p', String(pid)], { timeout: PROCESS_PROBE_TIMEOUT_MS, env })
+  if (probe.status === 0 && probe.stdout.length > 0) {
+    const started = Date.parse(probe.stdout.toString('utf8').trim())
+    if (Number.isFinite(started)) return started
+  }
+  const elapsed = spawnSync('ps', ['-o', 'etimes=', '-p', String(pid)], { timeout: PROCESS_PROBE_TIMEOUT_MS, env })
+  if (elapsed.status !== 0 || elapsed.stdout.length === 0) return undefined
+  const seconds = Number(elapsed.stdout.toString('utf8').trim())
+  if (!Number.isFinite(seconds)) return undefined
+  return Date.now() - seconds * 1000
+}
+
+function ownProcessStartTimeMs(): number | undefined {
+  if (!ownStartTimeResolved) {
+    ownStartTimeResolved = true
+    ownStartTime = processStartTimeMs(process.pid)
+  }
+  return ownStartTime
+}
+
+/**
+ * Bounded tolerance for legacy lock records. Locks written before the
+ * ms-precise probe recorded `startedAt` from `ps -o lstart=` at whole-second
+ * resolution; probing the SAME live process exactly (via /proc) then differs
+ * in the sub-second remainder. Treating that as PID reuse would steal a live
+ * owner's lock during a rolling upgrade and start a second ledger writer.
+ * Records written by the ms-precise probe carry `probe: 'exact'` and are
+ * compared strictly; anything else (older locks, second-granularity probes)
+ * falls back to this bounded tolerance.
+ */
+const LEGACY_START_TOLERANCE_MS = 2000
+
+/** Whether the recorded start time proves the recorded PID is another process. */
+function startTimeMismatch(recorded: number, actual: number, exact: boolean): boolean {
+  return exact ? recorded !== actual : Math.abs(recorded - actual) > LEGACY_START_TOLERANCE_MS
 }
 
 function betterExecution(a: ExecutionRecord, b: ExecutionRecord): ExecutionRecord {
@@ -86,7 +214,7 @@ function mergeTask(a: TaskRecord, b: TaskRecord): TaskRecord {
   return { ...newer, executions: [...byId.values()].sort((x, y) => x.startedAt - y.startedAt) }
 }
 
-function parseHostTasks(values: readonly unknown[], now: number): TaskRecord[] {
+function parseHostTasks(values: readonly unknown[]): TaskRecord[] {
   const rawById = new Map<string, Record<string, unknown>>()
   for (const value of values) {
     if (typeof value !== 'object' || value === null) continue
@@ -120,11 +248,14 @@ export class HostTaskLedger {
   private lockFd: number | undefined
   readonly file: string
   readonly lockFile: string
+  /** Small sidecar for the 30 s scheduler heartbeat (lastTickAt only). */
+  readonly schedulerFile: string
 
   constructor(dir: string = join(dshHome(), 'task-board'), private readonly now: () => number = Date.now) {
     mkdirSync(dir, { recursive: true })
     this.file = join(dir, 'ledger-v2.json')
     this.lockFile = join(dir, 'ledger-v2.lock')
+    this.schedulerFile = join(dir, 'scheduler-v2.json')
     this.lockFd = this.acquireLock()
     try {
       this.document = this.load(dir)
@@ -142,9 +273,15 @@ export class HostTaskLedger {
     }
   }
 
-  state(): LedgerState {
+  /** Revision + scheduler without any task cloning; feeds the SSE event frame. */
+  summary(): { revision: number; scheduler: TaskBoardSchedulerSnapshot } {
     const { importedSources: _imports, ...scheduler } = this.document.scheduler
-    return { revision: this.document.revision, tasks: cloneTasks(this.document.tasks), scheduler: { ...scheduler } }
+    return { revision: this.document.revision, scheduler: { ...scheduler } }
+  }
+
+  state(): LedgerState {
+    const { revision, scheduler } = this.summary()
+    return { revision, tasks: cloneTasks(this.document.tasks), scheduler }
   }
 
   subscribe(listener: () => void): () => void {
@@ -215,6 +352,14 @@ export class HostTaskLedger {
 
   setScheduler(patch: Partial<TaskBoardSchedulerSnapshot>): void {
     this.document.scheduler = { ...this.document.scheduler, ...patch }
+    // The 30 s heartbeat only moves lastTickAt; rewriting the whole ledger
+    // for it made idle idle cost O(ledger bytes) every tick. Persist it to a
+    // tiny sidecar instead; any other patch still goes through the full
+    // atomic commit.
+    if (patch.lastTickAt !== undefined && Object.keys(patch).every(key => key === 'lastTickAt')) {
+      this.writeSchedulerSidecar()
+      return
+    }
     this.commit(false)
   }
 
@@ -245,7 +390,7 @@ export class HostTaskLedger {
         const invalidScheduleIds = action.tasks
           .filter(task => task.schedule !== undefined && !isValidCron(task.schedule.cron))
           .map(task => task.id)
-        const incoming = parseHostTasks(action.tasks, now)
+        const incoming = parseHostTasks(action.tasks)
         const merged = new Map(this.document.tasks.map(task => [task.id, task]))
         for (const task of incoming) merged.set(task.id, merged.has(task.id) ? mergeTask(merged.get(task.id)!, task) : task)
         this.document.tasks = [...merged.values()]
@@ -364,7 +509,7 @@ export class HostTaskLedger {
     try {
       const parsed = JSON.parse(readFileSync(this.file, 'utf8')) as Partial<LedgerDocument>
       if (parsed.schemaVersion !== TASK_BOARD_SCHEMA_VERSION || !Array.isArray(parsed.tasks)) throw new Error('unsupported ledger schema')
-      const tasks = parseHostTasks(parsed.tasks, this.now())
+      const tasks = parseHostTasks(parsed.tasks)
       const invalidScheduleIds = (parsed.tasks as unknown[]).flatMap(value => {
         if (typeof value !== 'object' || value === null) return []
         const row = value as { id?: unknown; schedule?: unknown }
@@ -374,6 +519,13 @@ export class HostTaskLedger {
           ? [typeof row.id === 'string' ? row.id : 'unknown']
           : []
       })
+      const documentLastTickAt = typeof parsed.scheduler?.lastTickAt === 'number' ? parsed.scheduler.lastTickAt : undefined
+      const sidecarLastTickAt = this.readSchedulerSidecar()
+      // A sidecar write can be newer than the last full commit (crash between
+      // the two); lastTickAt only ever moves forward, so take the greater.
+      const lastTickAt = sidecarLastTickAt === undefined || (documentLastTickAt !== undefined && documentLastTickAt >= sidecarLastTickAt)
+        ? documentLastTickAt
+        : sidecarLastTickAt
       return {
         schemaVersion: TASK_BOARD_SCHEMA_VERSION,
         revision: Number.isSafeInteger(parsed.revision) && (parsed.revision as number) >= 0 ? parsed.revision as number : 0,
@@ -381,7 +533,7 @@ export class HostTaskLedger {
         scheduler: {
           timeZone: timeZone(),
           ledgerId: typeof parsed.scheduler?.ledgerId === 'string' && parsed.scheduler.ledgerId !== '' ? parsed.scheduler.ledgerId : crypto.randomUUID(),
-          ...(typeof parsed.scheduler?.lastTickAt === 'number' ? { lastTickAt: parsed.scheduler.lastTickAt } : {}),
+          ...(lastTickAt === undefined ? {} : { lastTickAt }),
           ...(typeof parsed.scheduler?.error === 'string' ? { error: parsed.scheduler.error } : {}),
           ...(invalidScheduleIds.length > 0 ? { error: `invalid cron disabled for task(s): ${invalidScheduleIds.join(', ')}` } : {}),
           ...(Array.isArray(parsed.scheduler?.importedSources) ? { importedSources: parsed.scheduler.importedSources.filter(x => typeof x === 'string') } : {}),
@@ -414,6 +566,43 @@ export class HostTaskLedger {
       requestId,
       fingerprint: request.fingerprint,
     }))
+  }
+
+  private readSchedulerSidecar(): number | undefined {
+    try {
+      const parsed = JSON.parse(readFileSync(this.schedulerFile, 'utf8')) as { lastTickAt?: unknown }
+      return typeof parsed.lastTickAt === 'number' && Number.isFinite(parsed.lastTickAt) ? parsed.lastTickAt : undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  /** Atomic write of the scheduler heartbeat sidecar (0600, tmp + rename + fsync). */
+  private writeSchedulerSidecar(): void {
+    const payload = JSON.stringify({ lastTickAt: this.document.scheduler.lastTickAt })
+    mkdirSync(dirname(this.schedulerFile), { recursive: true })
+    const tmp = `${this.schedulerFile}.tmp-${process.pid}`
+    let fd: number | undefined
+    try {
+      fd = openSync(tmp, 'w', 0o600)
+      writeFileSync(fd, payload, { encoding: 'utf8' })
+      fsyncSync(fd)
+      closeSync(fd)
+      fd = undefined
+      try { chmodSync(tmp, 0o600) } catch { /* Windows ACLs own access */ }
+      renameSync(tmp, this.schedulerFile)
+      try {
+        const dirFd = openSync(dirname(this.schedulerFile), 'r')
+        try { fsyncSync(dirFd) } finally { closeSync(dirFd) }
+      } catch {
+        // Windows does not permit fsync on a directory handle; rename remains atomic.
+      }
+    } catch (error) {
+      if (fd !== undefined) closeSync(fd)
+      try { unlinkSync(tmp) } catch { /* best-effort temporary cleanup */ }
+      throw error
+    }
+    this.notify()
   }
 
   private commit(bumpRevision = true): void {
@@ -451,7 +640,13 @@ export class HostTaskLedger {
     for (let attempt = 0; attempt < 2; attempt += 1) {
       try {
         const fd = openSync(this.lockFile, 'wx', 0o600)
-        writeFileSync(fd, JSON.stringify({ pid: process.pid, token: this.lockToken }), { encoding: 'utf8' })
+        const startedAt = ownProcessStartTimeMs()
+        // Linux /proc and Windows PowerShell probes are ms-precise; locks they
+        // write are compared strictly. Other POSIX probes (ps) stay
+        // second-granularity, so their records are compared with the bounded
+        // legacy tolerance.
+        const probe = process.platform === 'linux' || process.platform === 'win32' ? 'exact' : 'legacy'
+        writeFileSync(fd, JSON.stringify({ pid: process.pid, token: this.lockToken, startedAt, probe }), { encoding: 'utf8' })
         fsyncSync(fd)
         try { chmodSync(this.lockFile, 0o600) } catch { /* Windows ACLs own access */ }
         return fd
@@ -459,14 +654,42 @@ export class HostTaskLedger {
         const code = (error as NodeJS.ErrnoException).code
         if (code !== 'EEXIST') throw error
         let pid: number | undefined
+        let ownerStartedAt: number | undefined
+        let ownerExact = false
         try {
-          const owner = JSON.parse(readFileSync(this.lockFile, 'utf8')) as { pid?: unknown }
+          const owner = JSON.parse(readFileSync(this.lockFile, 'utf8')) as { pid?: unknown; startedAt?: unknown; probe?: unknown }
           if (typeof owner.pid === 'number') pid = owner.pid
+          if (typeof owner.startedAt === 'number') ownerStartedAt = owner.startedAt
+          ownerExact = owner.probe === 'exact'
         } catch {
-          throw new Error(`task-board ledger lock is unreadable: ${this.lockFile}`)
+          // A power-loss mid-write can leave a truncated lock; the same event
+          // killed the writer, so fail closed but explain the recovery.
+          throw new Error(`task-board ledger lock is unreadable: ${this.lockFile}; if this is a leftover from an unclean shutdown and no other DSH host is running, remove it manually and retry`)
         }
         if (pid !== undefined && processIsAlive(pid)) {
-          throw new Error(`task-board ledger is already owned by process ${pid}`)
+          const actualStartedAt = pid === process.pid ? ownProcessStartTimeMs() : processStartTimeMs(pid)
+          // A reused PID is exposed when the live process identity no longer
+          // matches the recorded one: either the recorded start time differs
+          // beyond the probe's resolution (strict for ms-precise 'exact'
+          // records, a bounded legacy tolerance for old second-granularity
+          // records written by ps), or (legacy locks without a start time)
+          // the lock file predates the live process and therefore cannot
+          // have been written by it. Takeover is safe in both cases — the
+          // original owner is gone.
+          const staleReuse = actualStartedAt !== undefined && (
+            ownerStartedAt !== undefined
+              ? startTimeMismatch(ownerStartedAt, actualStartedAt, ownerExact)
+              : (() => {
+                try { return statSync(this.lockFile).mtimeMs < actualStartedAt } catch { return true }
+              })()
+          )
+          if (!staleReuse) {
+            const confirmedOwner = ownerStartedAt !== undefined && actualStartedAt !== undefined && !startTimeMismatch(ownerStartedAt, actualStartedAt, ownerExact)
+            const hint = confirmedOwner
+              ? ''
+              : `; if this PID was reused after a crash and no other DSH host is running, remove ${this.lockFile} manually and retry`
+            throw new Error(`task-board ledger is already owned by process ${pid}${hint}`)
+          }
         }
         try { unlinkSync(this.lockFile) } catch (unlinkError) {
           if ((unlinkError as NodeJS.ErrnoException).code !== 'ENOENT') throw unlinkError

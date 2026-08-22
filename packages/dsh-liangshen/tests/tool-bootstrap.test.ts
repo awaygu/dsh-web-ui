@@ -254,7 +254,10 @@ describe('anchored-tool-bootstrap', () => {
     expect(first.messages).toHaveLength(2)
     expect(first.messages[0].id).toBe('user')
     const hint = first.messages[1]
+    expect(typeof hint.id).toBe('string')
+    expect(hint.id).not.toBe('')
     expect(hint.source.kind).toBe('instruction-hint')
+    expect(hint.id).toBe('instructions')
     expect(hint.content[0].text).toContain('Reference documents exist: ~/.dsh/AGENTS.md, AGENTS.md.')
     expect(hint.content[0].text).toContain('not task instructions')
     expect(hint.content[0].text).not.toContain('Global rules.')
@@ -265,6 +268,35 @@ describe('anchored-tool-bootstrap', () => {
       async () => ({ kind: 'enter', messages }),
     )
     expect(second.messages.map((entry: any) => entry.id)).toEqual(['user'])
+  })
+
+  test('instructionHint generates an id when the original instructions message has none (#510)', async () => {
+    const listeners = register({ instructionHint: true })
+    const preStepListener = listener(listeners, 'agent/pre-step')
+    const assembleListener = listener(listeners, 'system-prompt/assemble')
+    const sessionObj = { events: [{ type: 'tool/call' }] }
+    await assembleListener(undefined, { agent: { session: sessionObj } }, async () => ({
+      system: 'minimal persona',
+      tools: [{ name: 'bash' }, { name: 'read' }],
+    }))
+
+    const dump = {
+      role: 'user',
+      content: [{
+        type: 'text',
+        text: '<system-reminder>\n\nInstructions from: AGENTS.md\n\nRepo rules.\n</system-reminder>',
+      }],
+      source: { kind: 'agent-instructions' },
+    }
+    const messages = [message('user', 'user'), dump]
+    const result = await preStepListener(
+      { agent: { session: sessionObj }, messages, turn: 1, step: 1, signal: {} },
+      async () => ({ kind: 'enter', messages }),
+    )
+    const hint = result.messages[1]
+    expect(hint.source.kind).toBe('instruction-hint')
+    expect(hint.id).toEqual(expect.any(String))
+    expect(hint.id).not.toBe('')
   })
 
   test('instructionHint passes an instructions message with no file sections through', async () => {
@@ -289,7 +321,7 @@ describe('anchored-tool-bootstrap', () => {
     expect(result.messages).toEqual(messages)
   })
 
-  test('phase 1 only lets explicit user messages through, whatever messageSources names', async () => {
+  test('phase 1 honors the configured messageSources whitelist', async () => {
     const preStepListener = listener(register({ messageSources: ['user', 'agent-instructions'] }), 'agent/pre-step')
     const messages = [
       message('user', 'user'),
@@ -297,7 +329,39 @@ describe('anchored-tool-bootstrap', () => {
       message('skill-catalog', 'skills'),
     ]
     const result = await preStep(preStepListener, [], messages)
-    expect(result.messages.map((entry: any) => entry.id)).toEqual(['user'])
+    expect(result.messages.map((entry: any) => entry.id)).toEqual(['user', 'instructions'])
+  })
+
+  test('phase 1 lets goal auto-round messages through by default (issue #578)', async () => {
+    const preStepListener = listener(register(), 'agent/pre-step')
+    const messages = [
+      message('goal', 'goal-round'),
+      message('agent-instructions', 'instructions'),
+      message(undefined, 'seed'),
+    ]
+    const result = await preStep(preStepListener, [], messages)
+    expect(result.messages.map((entry: any) => entry.id)).toEqual(['goal-round'])
+  })
+
+  test('a tool-less goal auto-round response still promotes (issue #578 deadlock)', async () => {
+    // A goal round that reaches the model can end without any tool call and
+    // without a minimal-like reasoning anchor. Branch (d) must still promote
+    // — otherwise every later goal round is filtered out again and the goal
+    // resume/pause loop deadlocks.
+    const assembleListener = listener(
+      register({ promoteAfterFirstResponse: true, anchorGate: true, maxBootstrapSteps: 4 }),
+      'system-prompt/assemble',
+    )
+    const tools = [{ name: 'bash' }, { name: 'read' }, { name: 'edit' }]
+    const events = [
+      {
+        type: 'assistant/message',
+        data: { message: { content: [{ type: 'text', text: 'Continuing the goal this round.' }] } },
+      },
+      turnEndEvent(1),
+    ]
+    const result = await assemble(assembleListener, events, tools)
+    expect(result.tools).toEqual(tools)
   })
 
   test('anchorGate holds promotion after a standard-like first block', async () => {

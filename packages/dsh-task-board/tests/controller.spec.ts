@@ -2,7 +2,7 @@
  * Controller tests: orchestration — persistence, view state, navigation
  * awareness, and the full run loop (running → started(sessionId) → settled).
  */
-import { describe, expect, it, vi } from 'vitest'
+import { describe, expect, it } from 'vitest'
 import { BoardController, type ControllerDeps } from '../src/core/controller.ts'
 import { ExecutionService, type ExecutionEvent } from '../src/core/execution.ts'
 import { InMemoryTaskStore } from '../src/core/store.ts'
@@ -104,7 +104,7 @@ describe('BoardController execution options', () => {
 
 describe('BoardController lifecycle', () => {
   it('loads the persisted ledger on start', () => {
-    const { controller, store } = makeController()
+    const { store } = makeController()
     seedTask(store)
     const reloaded = new BoardController({
       store, exec: new StubExec() as unknown as ExecutionService,
@@ -306,7 +306,7 @@ describe('run loop', () => {
   it('reconciles running tasks left over from a previous load', async () => {
     const stub = new StubExec()
     stub.reconcileResult = { kind: 'settled', taskId: 'task-a', executionId: 'e1', outcome: 'cancelled', error: 'gone' }
-    const { controller, store } = makeController(stub)
+    const { store } = makeController(stub)
     const task = seedTask(store, { id: 'task-a' })
     store.save([{ ...task, status: 'running', executions: [{ id: 'e1', sessionId: 's-1', startedAt: NOW, endedAt: undefined, result: undefined, error: undefined }] }])
     const reloaded = new BoardController({
@@ -560,6 +560,52 @@ describe('external (cross-tab) ledger changes', () => {
     const persisted = store.load()[0]
     expect(persisted.title).toBe('外部新标题')
     expect(JSON.stringify(store.load())).not.toContain('旧标题')
+  })
+
+  it('re-arms a session change that arrives while reconcile is in flight', async () => {
+    let resolveFirst: (() => void) | undefined
+    let reconcileCalls = 0
+    const stub = {
+      reconcile: (task: { id: string }): Promise<ExecutionEvent | undefined> => {
+        reconcileCalls += 1
+        if (task.id === 'task-a') {
+          // The startup pass for A parks; a later pass finds A still running.
+          if (reconcileCalls === 1) return new Promise(resolve => { resolveFirst = () => resolve(undefined) })
+          return Promise.resolve(undefined)
+        }
+        // B's session already finished: settle it.
+        return Promise.resolve({ kind: 'settled', taskId: 'task-b', executionId: 'e2', outcome: 'succeeded', error: undefined })
+      },
+    }
+    const store = new ExternalAwareStore()
+    const sessions = new FakeSessions()
+    const seedA = seedTask(store, { id: 'task-a', title: 'A' })
+    const seedB = seedTask(store, { id: 'task-b', title: 'B' })
+    const runningA = { ...seedA, status: 'running' as const, executions: [{ id: 'e1', sessionId: 's-1', startedAt: NOW, endedAt: undefined, result: undefined, error: undefined }] }
+    const runningB = { ...seedB, status: 'running' as const, executions: [{ id: 'e2', sessionId: 's-2', startedAt: NOW, endedAt: undefined, result: undefined, error: undefined }] }
+    store.save([runningA, runningB])
+    const controller = new BoardController({
+      store, exec: stub as unknown as ExecutionService, sessions, now: () => NOW, uuid, reconcileDebounceMs: 0,
+    })
+    controller.start()
+    await flush()
+    // The startup pass is parked on A.
+    expect(reconcileCalls).toBe(1)
+    expect(resolveFirst).toBeDefined()
+
+    // B's session finishes while A's reconcile is still in flight; the change
+    // must re-arm the debounce, not drop B.
+    sessions.setCurrent('s-other')
+    await flush()
+    resolveFirst!()
+    await flush()
+    await flush()
+    await flush()
+
+    // The re-armed pass settled B instead of dropping the notification.
+    const b = controller.getSnapshot().tasks.find(t => t.id === 'task-b')
+    expect(b?.status).toBe('done')
+    expect(reconcileCalls).toBeGreaterThanOrEqual(3)
   })
 
   it('stops reacting to external changes after dispose', () => {

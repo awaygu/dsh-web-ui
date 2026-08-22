@@ -1,6 +1,6 @@
 /**
  * Skill center API client (browser half). Talks to the host route family over
- * same-origin fetch; the host enforces the loopback fence on its side.
+ * same-origin fetch; the host enforces the trust fence on its side.
  */
 
 /** Route paths mirrored from the host (src/routes.ts ROUTES). */
@@ -19,6 +19,8 @@ export interface SkillEntry {
   provider?: string
   level: string
   path?: string
+  /** True for skills discovered through a symlink entry (deletion not allowed). */
+  linked?: boolean
   modelInvocable: boolean
   userInvocable: boolean
 }
@@ -50,8 +52,8 @@ export class SkillApi {
   }
 
   /** Enable or disable a skill (rewrites disable-model-invocation). */
-  async setEnabled(name: string, enabled: boolean): Promise<{ name: string; enabled: boolean; modelInvocable: boolean; path?: string }> {
-    return this.request(API.setEnabled, { method: 'POST', body: { name, enabled } })
+  async setEnabled(name: string, path: string, enabled: boolean): Promise<{ name: string; enabled: boolean; modelInvocable: boolean; path?: string }> {
+    return this.request(API.setEnabled, { method: 'POST', body: { name, path, enabled } })
   }
 
   /** Create a skill file under the user or project root. */
@@ -60,8 +62,8 @@ export class SkillApi {
   }
 
   /** Delete a skill (moves it into .trash). */
-  async remove(name: string): Promise<{ ok: true; name: string; moved: string }> {
-    return this.request(API.delete, { method: 'POST', body: { name } })
+  async remove(name: string, path: string): Promise<{ ok: true; name: string; moved: string }> {
+    return this.request(API.delete, { method: 'POST', body: { name, path } })
   }
 
   private async request<T>(path: string, options: { method?: string; body?: unknown } = {}): Promise<T> {

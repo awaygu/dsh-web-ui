@@ -24,8 +24,9 @@ Re-implemented from the pet feature of the Codex desktop app, as an official DSH
 | Hide/Summon | The hover panel sits below the pet (lifted above the status bubbles when there is no room below) and provides 隐藏 (Hide); after hiding, a 召唤{name} (Summon {name}) button appears |
 | Witty remarks | Built-in remark library (10 lines per event) plus per-pet custom lines; success lines rotate by persisted success counts and cooldown lines by persisted rejection counts |
 | Status bubbles | Only the most recently active top-level session speaks by default — when several sessions run at once, the rest collapse behind a +N badge on the main bubble instead of stacking a tall column; hover the bubble (or tap the badge, for touch) to fan every session's bubble out above it and click one to jump to its session; subagent sessions report through their spawning conversation and never occupy a bubble of their own; transient interaction feedback temporarily takes priority. Bubble copy comes from generous rotating pools per scene (waiting / thinking / writing / done / failed...), tool calls map onto per-family witty lines carrying the real argument hint (e.g. 跑跑 npm test), and a long-lived scene re-phrases itself every few seconds |
-| Inner whispers | 碎碎念: while the model streams, the pet occasionally speaks its inner voice through its own bubble — a fresh whisper takes over the display session's bubble and re-tints it violet (「」 quotes included) instead of stacking a second bubble — keyword moods woken by the model output (errors, test greens, plans, victories...) plus ambient whispers earned by output volume; paced by a cooldown, the status copy returns after a few seconds |
+| Inner whispers | 碎碎念: while the model streams, the pet occasionally speaks its inner voice through its own bubble — a fresh whisper takes over the display session's bubble and marks it with 「」 quotes — sharing the same DeepSeek-blue glass as every status bubble, so stacked bubbles never clash — instead of stacking a second bubble — keyword moods woken by the model output (errors, test greens, plans, victories...) plus ambient whispers earned by output volume; paced by a cooldown, the status copy returns after a few seconds |
 | Multi-session activity | The pet is host-global: the most recent meaningful event drives the sprite animation while every active top-level session reports its own state in a separate bubble; completed turns from every session (subagents included) contribute affinity and treats |
+| Voice packs and panel DIY | A per-pet voice.json plus the global $DSH_HOME/pets/.voice.json override replace every bubble word and the hover panel (button labels, stat formats, button visibility); merge precedence per-pet > global > built-in, broken packs warn and never reject a pet |
 
 ## Pet contract
 
@@ -59,13 +60,139 @@ A pet is a directory holding one `pet.json` manifest and one atlas image. Nothin
 - `frames` counts the used columns per row (defaults to the hatch-pet contract table `[6, 8, 8, 4, 5, 8, 6, 6, 6]`); `tracks` overrides per-frame durations (cycled to the row's frame count), `loop`, and `fallback` per animation (defaults: everything loops; `jumping` and `failed` hold their last frame, then fall back to `idle`).
 - `sequences` optionally maps activity scenes (`idle` / `waiting` / `thinking` / `tool` / `review` / `done` / `failed`) to at least 5 animation tracks. Each item plays every frame for the durations in `tracks`, then the next item starts; the complete sequence loops. An omitted scene keeps its canonical single-track playback.
 
+### Manifest v2 (pet center, #623)
+
+A pet directory's `pet.json` declares its renderer explicitly in v2:
+
+- `petManifestVersion: 2` (absent = v1, compat-read as `sprite2d` with a migration hint);
+- `renderer`: `"sprite2d"` (the atlas contract above) or `"live2d"`;
+- `license` (required in v2): asset license identifier — community pets carry provenance;
+- a renderer block: `sprite2d` (spritesheetPath/cell/columns/atlasRows/frames/tracks) or `live2d` (model/motions/expressions/hitAreas/scale/translate).
+
+Validation is fail-closed on structure (unknown fields or renderer kinds reject the entry with a diagnostic) and warn-and-drop on sequence/remark content. The machine-readable schema lives at `contracts/pet-manifest-v2.schema.json`; the authoritative validator is `src/manifest-v2.ts`. Migrate v1 manifests with `node scripts/dsh-pet-migrate-v2.mjs <dir> --write` (dry-run by default; keeps `pet.json.v1.bak`).
+
 Where pets come from (later sources override earlier ones on id collision):
 
 1. **Built-in**: `assets/<dir>/pet.json` in this package.
-2. **Custom pets**: `${CODEX_HOME:-~/.codex}/pets/<pet>/pet.json` — the hatch-pet pipeline stages its output there, so a hatched pet appears in the selector with no further wiring.
-3. **Composed**: `PetConfig.pets` manifest entries passed to the plugin by the embedding application.
+2. **Legacy custom pets**: `${CODEX_HOME:-~/.codex}/pets/<pet>/pet.json` — the hatch-pet pipeline stages its output there, so a hatched pet appears in the selector with no further wiring.
+3. **Pet-center user directory**: `$DSH_HOME/pets/<id>/` — the recommended home for your pets (see the CLI below).
+4. **Composed**: `PetConfig.pets` manifest entries passed to the plugin by the embedding application.
 
-The registry is built once at host startup; add or change a pet, then restart `dsh web`.
+Validate and install a pet directory with the CLI (no build step, no npm publish):
+
+```sh
+node scripts/dsh-pet validate <dir>           # manifest + assets + Live2D reference closure + voice.json
+node scripts/dsh-pet install <dir>            # validate, then copy into $DSH_HOME/pets/<id>/
+node scripts/dsh-pet install <dir> --force    # overwrite an existing same-id install
+```
+
+Invalid entries never override a working pet: they are skipped with a diagnostic listed in the settings (Pet section). The registry is built once at host startup; add or change a pet, then restart `dsh web`.
+
+## Voice packs and panel chrome (voice.json, pet-center M4, #677)
+
+Every word in the thought bubble (status / tool / whisper copy) and the hover panel (button labels, stat formats, button visibility) can be replaced by a pet — or by you — without touching plugin code. Pets ship an optional voice.json in their directory; a global override at $DSH_HOME/pets/.voice.json re-voices pets without editing their directories.
+
+```jsonc
+{
+  "voicePackVersion": 1,              // optional; absent reads as v1
+  "status": {                          // status pools keyed by scene id; per-key override
+    "done": ["Done for today!", "Another one down"]
+  },
+  "tools": {                           // tool pools keyed by tool family; {tool} / {hint} allowed
+    "shell": ["Running {hint}", "Hit enter: {hint}"]
+  },
+  "toolRemaining": ["{n} helpers still at work"],   // {n} allowed
+  "whispers": {                        // murmur pools; each section replaces the built-in one
+    "generic": ["On it", "Almost there"],  // ambient pool; an explicit empty array mutes it
+    "rules": [                         // ordered keyword rules; given rules replace the built-ins
+      { "keywords": ["all tests pass"], "pool": ["All green!"] }
+    ]
+  },
+  "panel": {                           // hover panel; unset slots keep the plugin i18n copy
+    "labels": { "feed": "Treat", "hide": "Dive", "rename": "Rename me", "confirm": "Sure" },
+    "stats": { "rank": "Affinity {rank}", "treats": "Treats x{n}", "points": "{points} pts" },
+    "actions": ["feed", "rename", "hide"]  // subset in canonical order; absent = all; [] = stats only
+  }
+}
+```
+
+- Merge precedence (per slot): the pet voice.json > the global .voice.json > built-in copy. status/tools merge per key, whispers replace per section, panel merges per slot; any slot a layer misses falls through.
+- Placeholder whitelist: tools accept {tool} / {hint}; toolRemaining accepts {n}; panel.stats accept {rank} / {n} / {points}; status, whisper and panel-label lines accept no placeholders (lines carrying one are dropped with a warning).
+- Caps (warn-and-drop): at most 64 lines per pool and 160 characters per line; at most 32 rules and 16 keywords (40 characters) per rule; panel labels 40 and stats 80 characters.
+- A broken pack never breaks the pet: voice.json that is not valid JSON or whose root is not an object is ignored with a warning; every other issue drops its slot only. Diagnostics appear under Settings > Pet directory diagnostics. node scripts/dsh-pet validate <dir> fails installs on structure errors and lists content issues as warnings.
+- Semantics: an empty status/tools pool falls back to the built-in copy (a scene line always renders); an explicit empty whisper pool mutes that channel; an empty panel actions array hides all three buttons; uncovered buttons and stats keep the plugin bilingual dictionary.
+
+## Live2D pets (renderer: live2d)
+
+Live2D pets render through PixiJS/WebGL: the MIT pixi.js + untitled-pixi-live2d-engine stack ships inside this plugin as a lazily loaded vendor bundle, so sprite-only installations never download or parse it. **The Cubism Core runtime is never bundled or downloaded by this plugin** — Live2D's proprietary license forbids redistributing it. To enable a Live2D pet:
+
+1. Obtain the official Live2D Cubism SDK for Web yourself (you accept Live2D's license) and take `live2dcubismcore.min.js` from it.
+2. Place it at `$DSH_HOME/pets/.runtime/live2dcubismcore.min.js` — the plugin serves it to the page from there, alongside its own vendor bundle.
+3. Install a Live2D pet (a directory with `pet.json` v2, `renderer: "live2d"`, and the model files).
+
+If the core is absent, a Live2D pet shows an install-guidance card where the model would render; sprite2d pets are unaffected. Legal note: this plugin is an "extensible application" in Live2D's terms — works you publish with user-loadable models may require a Live2D release license regardless of scale; evaluate your obligations before publishing derivative works.
+
+A Live2D manifest maps the seven activity phases onto the model's motion groups:
+
+```json
+{
+  "petManifestVersion": 2,
+  "id": "my-live2d-pet",
+  "displayName": "My Live2D Pet",
+  "license": "CC0-1.0",
+  "renderer": "live2d",
+  "live2d": {
+    "model": "model/my-pet.model3.json",
+    "motions": { "idle": "Idle", "thinking": "Think", "failed": "TapBody" },
+    "hitAreas": ["Body"]
+  }
+}
+```
+
+- `model`: the `.model3.json` path relative to the pet directory. Every file the model references (moc, textures, motions, physics, pose, expressions) must live inside the directory — the host serves exactly that reference closure.
+- `motions` (required, `idle` mandatory): phase → motion group. Unmapped phases and groups the model lacks fall back to `idle`; a group holding several motions plays a random one. The official Cubism sample models ship only `Idle` and `TapBody` groups.
+- `expressions` (optional): phase → expression name, layered over the motion.
+- `hitAreas` (optional): a tap landing on a listed hit area plays the model's `TapBody` group, then returns to the phase's group. Every tap still counts as petting — the chrome owns interactions exactly like sprite2d.
+- `scale` / `translate` (optional): the model auto-fits the display box; `scale` multiplies the fit (default 1, range (0, 10]) and `translate` offsets it in px from the center.
+
+Model licensing: the official Live2D sample models (Hiyori, Haru, and friends) are evaluation-only and must not be redistributed — ship only models you have rights to (original creations or permissively licensed ones).
+
+## Status decorations (decoration.json, pet-center M5, #567)
+
+A status bubble can carry a small ornament ahead of its text (built-in: the spouting whale), driven by the ActivityPhase stream. Decorations are independent of pets: own descriptor, own id, own directory — switching pets never switches decorations. Entry assets are PNG/WebP single-row sprite strips only (no SVG/CSS); the bubble always keeps its role=status/aria-live (or session-bubble button semantics), the ornament is aria-hidden; prefers-reduced-motion holds the segment first frame, and a broken asset only removes the ornament — the text stays.
+
+```jsonc
+{
+  "decorationManifestVersion": 1,
+  "id": "whale",                     // unique lowercase kebab id
+  "displayName": "Spouting whale",    // optional
+  "license": "MIT",                   // required: asset provenance
+  "entry": "whale-frames.png",        // PNG/WebP strip, relative to this directory
+  "cell": { "width": 64, "height": 48 },
+  "columns": 4,                       // strip frames (1..16)
+  "frameMs": 160,                     // constant frame duration; or "durations": [..] per frame
+  "loop": true,
+  "phases": {                         // ActivityPhase -> inclusive frame segment; "hide" = none; default hide
+    "idle": "hide",
+    "waiting": { "from": 0, "to": 1 },
+    "thinking": { "from": 0, "to": 3 },
+    "done": { "from": 2, "to": 3 },
+    "failed": { "from": 3, "to": 3 }
+  }
+}
+```
+
+- Structure is fail-closed (unknown fields, out-of-range geometry, non-PNG/WebP entries reject with diagnostics); segment content is warn-and-drop. The machine-readable twin lives at contracts/status-decoration-v1.schema.json; the authoritative validator is src/decoration.ts.
+- Sources: built-in assets/decorations/ plus the user directory $DSH_HOME/pets/decorations/<id>/ (same id overrides the built-in). Assets ride /api/pet/decoration/<id>/<file> with the same containment and allow-lists as pet assets.
+- Switch: Settings > Pet > Status decoration (on by default). The built-in whale derives from the DeepSeek wordmark (MIT); see THIRD_PARTY_NOTICES.md.
+## Built-in pets
+
+| Registry id | Selector label | Source |
+|---|---|---|
+| `whale-girl` | 鲸鱼娘（原版） | The repository's original whale-girl atlas |
+| `whale-girl-refined` | 鲸鱼娘（精致版） | An AI-assisted derivative with repaired and refined details, based on the whale-girl design direction |
+
+The refined variant references DreamSkin's “DeepSeek-Whale” theme. The historical source record identifies `powerdog996` as the original theme author and marks the theme as MIT: [DreamSkin](https://dreamskin.cc), [repository source record](https://github.com/zhu1090093659/dsh-web-ui/commit/87edd7ff4800dffd40bc93fb76e4ae450390facd). This attribution records the source and derivative relationship; it does not present the refined variant as an official work of the original author or redefine the original artwork's licensing scope.
 
 ## Animation preview
 
@@ -101,7 +228,8 @@ dsh-pet/
 |       |-- sequences.ts     # full-track scene sequence timing
 |       |-- spritesheet.ts   # atlas geometry helpers + track trimming
 |       `-- pet.module.css
-|-- assets/whale/            # built-in whale-girl (pet.json + spritesheet.webp + previews)
+|-- assets/whale/            # built-in original whale-girl (manifest + atlas + previews)
+|-- assets/whale-refined/    # built-in refined whale-girl registry variant
 `-- cordis.patch.yml         # bundle patch: inserts the pet plugin row
 ```
 
@@ -121,7 +249,7 @@ global React root (createRoot → document.body) <-- polling 2s -- pet-client (b
 - **Registry**: the host normalizes every manifest into a full render definition (geometry, per-row frame counts, per-track durations) and serves it over `/api/pet/pets`; the browser half renders any entry from that definition and carries no per-pet code.
 - **Selection & naming**: `petId` lives in the settings namespace; per-pet names live in `pet.json` under `names`, edited through the hover-panel rename of the active pet. Legacy installs migrate their flat `name` onto the whale girl.
 - **Multi-session semantics**: the API and browser mount are host-global and expose no foreground-session identity. Concurrent sessions each keep their own projected state: the most recent meaningful event drives the sprite animation, while every active TOP-LEVEL session reports its stage in its own bubble (the state view's sessions list, capped at 12 most-recent). Subagent children are tracked for animation, rewards, and the single display bubble but render no bubble of their own, so N conversations never multiply into an N-plus-subagents stack. Every session's completed turns are still rewarded independently; disposing a session removes its bubble, and disposing the display session falls back to the most recent remaining one.
-- **Mount point**: `document.body` (global React root, always shown: no session / new session / mid-session — the old mount point `conversation.composer.dock` only rendered in an active session, hiding the pet in new sessions); the component uses `createPortal` internally to render the global floating layer.
+- **Mount point**: `document.body` (global React root, always shown: no session / new session / mid-session — the old mount point `conversation.composer.dock` only rendered in an active session, hiding the pet in new sessions); the component uses `createPortal` internally to render the global floating layer. The root follows the plugin fiber lifecycle: fiber disposal unmounts the React root, removes the container, and stops the poll loop and settings subscription; a hot-reloaded or re-injected bundle takes over the page-global slot, so the page always holds exactly one `[data-dsh-pet-root]` (issue #785).
 - **Rendering**: CSS sprite (background-position) per-frame animation; frame durations and optional scene sequences come from the served definition. The hover panel is anchored below the pet with a pointer bridge across the gap; when the viewport leaves no room below, it flips above the pet and is lifted clear of the status bubble stack so the two never overlap.
 - **Communication**: browser ↔ host over the same-origin `/api/pet/*` JSON endpoints (state/pets/interact/set-visible/set-config/set-name/set-pet); each pet's atlas loads from `/pet/<id>/<spritesheetPath>` — the plugin self-sufficiently provides its own API and assets (the same pattern as dsh-remote-web-ui's `/api/pair`).
 
@@ -131,7 +259,7 @@ Install the family aggregate package `@linxin666/dsh-web-ui-all` (all plugins an
 
 ```sh
 ### From npm (recommended)
-dsh plugin --profile web add @linxin666/dsh-pet
+dsh plugin --profile web add @linxin666/dsh-pet@latest
 
 ### From the repository (development)
 git clone https://github.com/zhu1090093659/dsh-web-ui.git
@@ -156,7 +284,15 @@ The browser bundle rides the `window.__ModuleLoader__.load` contract; React/cord
 
 ## Sprites and animation-track calibration
 
-The built-in whale-girl atlas is generated by the hatch-pet pipeline as 9 states × 8 columns: `assets/whale/spritesheet.webp` (1536×1872, 8 columns × 9 rows of 192×208 cells) + `assets/whale/pet.json`. The frame count, rhythm, and scene rotation live in that manifest's `frames`, `tracks`, and `sequences` fields; pets without overrides follow the hatch-pet contract rhythm and canonical single-track scene mapping. Redoing artwork therefore only edits `assets/whale/pet.json` (row-order contract: 0 idle / 1 running-right / 2 running-left / 3 waving / 4 jumping / 5 failed / 6 waiting / 7 running / 8 review).
+The two built-in whale-girl atlases use the same 9-state × 8-column contract: `assets/whale/` is the original and `assets/whale-refined/` is the refined variant. Each atlas is 1536×1872 (8 columns × 9 rows of 192×208 cells). Frame counts, rhythm, and scene rotation live in each directory's `pet.json`; pets without overrides follow the hatch-pet contract rhythm and canonical single-track scene mapping (row order: 0 idle / 1 running-right / 2 running-left / 3 waving / 4 jumping / 5 failed / 6 waiting / 7 running / 8 review).
+
+## Security model
+
+- Every `/api/pet/*` and `/pet/<id>/*` route is loopback-only by default (the shared plugin-family fence: loopback socket + Host header + browser same-origin markers): unpaired LAN clients get `403 forbidden: loopback-only` before any pet state or atlas is served. When `dsh-remote-web-ui` is also loaded, a live paired-device cookie is an additional allow path (the same cookie `api/gate` already checks); unpaired and revoked devices stay 403. The pet does not depend on the remote plugin.
+- Asset serving resolves both the pet directory and the candidate file through `realpath`; symlink escapes are refused (403). Files are size-capped before being read into memory (manifest 64 KB, imagery 20 MB; over-cap answers 413).
+- Live2D models are served by closure: only the manifest, the declared primary assets, and the files the `.model3.json` references (each screened against traversal, absolute and URL forms).
+- The plugin never downloads executables and never bundles the Live2D Cubism Core.
+- Manifests are fail-closed on structure: unknown fields or renderers reject the entry with a diagnostic shown in settings.
 
 ## License
 

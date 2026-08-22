@@ -1,9 +1,10 @@
-import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { spawn, spawnSync } from 'node:child_process'
+import { mkdtempSync, readFileSync, readdirSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { createTask, startExecution, withSchedule, type TaskRecord } from '../src/core/tasks.ts'
-import { HostTaskLedger } from '../src/host-ledger.ts'
+import { HostTaskLedger, processIsAlive, processState } from '../src/host-ledger.ts'
 
 const roots: string[] = []
 const NOW = new Date(2026, 7, 16, 10, 0, 30).getTime()
@@ -16,6 +17,65 @@ function tempRoot(): string {
 
 function task(id: string, updatedAt = NOW): TaskRecord {
   return { ...createTask({ title: id, description: '', prompt: id }, NOW - 1000, id), updatedAt }
+}
+
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
+}
+
+/**
+ * The start time of a live process exactly as the legacy `ps -o lstart=`
+ * probe recorded it: whole-second resolution. Used to simulate locks written
+ * by the pre-ms-probe implementation during a rolling upgrade.
+ */
+function secondGranularStartMs(pid: number): number | undefined {
+  if (process.platform === 'win32') return undefined
+  try {
+    const probe = spawnSync('ps', ['-o', 'lstart=', '-p', String(pid)], { timeout: 3000, env: { ...process.env, LC_ALL: 'C' } })
+    if (probe.status !== 0 || probe.stdout.length === 0) return undefined
+    const started = Date.parse(probe.stdout.toString('utf8').trim())
+    return Number.isFinite(started) ? started : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Try to leave a short-lived orphan behind whose exit is not reaped, so it
+ * occupies the PID table as a zombie (`process.kill(pid, 0)` then reports it
+ * alive). Works on Linux where PID 1 does not reap promptly (containers, some
+ * CI inits); returns undefined where init reaps orphans immediately, so
+ * callers skip rather than flake.
+ */
+function spawnZombie(): number | undefined {
+  if (process.platform !== 'linux') return undefined
+  try {
+    const probeFile = join(tmpdir(), `dsh-task-board-zombie-${process.pid}-${Math.random().toString(36).slice(2)}`)
+    const shell = spawn('sh', ['-c', `sleep 0.2 & echo $! > "${probeFile}"`], { stdio: 'ignore' })
+    shell.unref()
+    const deadline = Date.now() + 3000
+    let pid: number | undefined
+    while (Date.now() < deadline) {
+      try {
+        const raw = readFileSync(probeFile, 'utf8').trim()
+        if (raw !== '') {
+          const parsed = Number(raw)
+          if (Number.isSafeInteger(parsed)) pid = parsed
+          break
+        }
+      } catch { /* shell still starting */ }
+      sleepSync(50)
+    }
+    if (pid === undefined) return undefined
+    const zombieDeadline = Date.now() + 2500
+    while (Date.now() < zombieDeadline) {
+      if (processState(pid) === 'Z') return pid
+      sleepSync(50)
+    }
+    return undefined // init reaped it before we could observe the zombie
+  } catch {
+    return undefined
+  }
 }
 
 afterEach(() => {
@@ -141,6 +201,139 @@ describe('HostTaskLedger', () => {
     successor.dispose()
   })
 
+  it('takes over a stale legacy lock whose pid was reused by a newer process', () => {
+    const root = tempRoot()
+    const lockFile = join(root, 'ledger-v2.lock')
+    // Legacy lock from a crashed owner: no recorded start time, old mtime.
+    writeFileSync(lockFile, JSON.stringify({ pid: process.pid, token: 'stale-owner' }), { encoding: 'utf8' })
+    const past = Date.now() - 60 * 60 * 1000
+    utimesSync(lockFile, past / 1000, past / 1000)
+    const ledger = new HostTaskLedger(root, () => NOW)
+    expect(ledger.state().scheduler.ledgerId).toBeDefined()
+    ledger.dispose()
+  })
+
+  it('takes over a lock whose recorded start time does not match the live pid', () => {
+    const root = tempRoot()
+    const lockFile = join(root, 'ledger-v2.lock')
+    writeFileSync(lockFile, JSON.stringify({ pid: process.pid, startedAt: Date.now() + 86_400_000 }), { encoding: 'utf8' })
+    const ledger = new HostTaskLedger(root, () => NOW)
+    expect(ledger.state().scheduler.ledgerId).toBeDefined()
+    ledger.dispose()
+  })
+
+  it('fails closed with a recovery hint when a fresh legacy lock cannot be disproved', () => {
+    const root = tempRoot()
+    const lockFile = join(root, 'ledger-v2.lock')
+    // A legacy lock with a fresh mtime cannot be proven stale by ordering,
+    // so the ledger must refuse to start and explain how to recover.
+    writeFileSync(lockFile, JSON.stringify({ pid: process.pid }), { encoding: 'utf8' })
+    let message = ''
+    try {
+      new HostTaskLedger(root, () => NOW)
+    } catch (error) {
+      message = (error as Error).message
+    }
+    expect(message).toContain('already owned by process')
+    expect(message).toContain('remove')
+    expect(message).toContain(lockFile)
+  })
+
+  it('takes over a legacy lock whose recorded pid is dead (power-loss leftover)', () => {
+    const root = tempRoot()
+    const lockFile = join(root, 'ledger-v2.lock')
+    // Issue #886: an unclean shutdown (power loss) leaves a lock whose pid
+    // is no longer alive after the next boot. The dead pid must not block
+    // startup: the lock is stale by liveness alone.
+    const dead = spawnSync(process.execPath, ['-e', ''], { timeout: 5000 })
+    expect(dead.pid).toBeDefined()
+    writeFileSync(lockFile, JSON.stringify({ pid: dead.pid, token: 'power-loss-owner' }), { encoding: 'utf8' })
+    const ledger = new HostTaskLedger(root, () => NOW)
+    expect(ledger.state().scheduler.ledgerId).toBeDefined()
+    ledger.dispose()
+  })
+
+  it('names the lock file and a recovery hint when the lock is unreadable', () => {
+    const root = tempRoot()
+    const lockFile = join(root, 'ledger-v2.lock')
+    // A power-loss mid-write can leave a truncated lock. The same event
+    // killed the writer, so the next start must fail closed but explain
+    // exactly how to recover instead of a bare "unreadable" error.
+    writeFileSync(lockFile, '{not-json', { encoding: 'utf8' })
+    let message = ''
+    try {
+      new HostTaskLedger(root, () => NOW)
+    } catch (error) {
+      message = (error as Error).message
+    }
+    expect(message).toContain('unreadable')
+    expect(message).toContain('remove')
+    expect(message).toContain(lockFile)
+  })
+
+  it('takes over a lock owned by an unreaped zombie process', () => {
+    const zombie = spawnZombie()
+    if (zombie === undefined) return // environment reaps orphans; cannot exercise
+    const root = tempRoot()
+    // Record the zombie's REAL (legacy second-granularity) start time, so the
+    // identity comparison alone would look like a live owner. Only the
+    // zombie-state check (processIsAlive === false) lets this lock be taken
+    // over — the test fails without it.
+    const startedAt = secondGranularStartMs(zombie)
+    if (startedAt === undefined) return // cannot simulate the legacy record
+    writeFileSync(join(root, 'ledger-v2.lock'), JSON.stringify({ pid: zombie, token: 'zombie-owner', startedAt }), 'utf8')
+    const ledger = new HostTaskLedger(root, () => NOW)
+    expect(ledger.state().scheduler.ledgerId).toBeDefined()
+    ledger.dispose()
+  })
+
+  it('fails closed on a live owner whose lock records a second-granularity (legacy ps) start time', () => {
+    const root = tempRoot()
+    // A live old-version owner wrote its own start time through `ps -o
+    // lstart=` (whole-second resolution). The new ms-precise /proc probe
+    // reports the same process with a sub-second remainder; strict equality
+    // would read that as PID reuse, unlink the live owner's lock and start a
+    // second ledger writer during a rolling upgrade. The bounded legacy
+    // tolerance must keep this owner protected (fail closed).
+    const startedAt = secondGranularStartMs(process.pid)
+    if (startedAt === undefined) return // ps unavailable — cannot exercise
+    const lockFile = join(root, 'ledger-v2.lock')
+    writeFileSync(lockFile, JSON.stringify({ pid: process.pid, token: 'legacy-live-owner', startedAt }), 'utf8')
+    let message = ''
+    try {
+      new HostTaskLedger(root, () => NOW)
+    } catch (error) {
+      message = (error as Error).message
+    }
+    expect(message).toContain('already owned by process')
+    // The tolerance classifies the owner as confirmed (sub-second probe
+    // difference), so no misleading "PID was reused — remove the lock"
+    // recovery hint is appended.
+    expect(message).not.toContain('remove')
+  })
+
+  it('treats an unreaped zombie as dead even though kill(0) reports it alive', () => {
+    const zombie = spawnZombie()
+    if (zombie === undefined) return // environment reaps orphans; cannot exercise
+    expect(processState(zombie)).toBe('Z')
+    let killSaysAlive = false
+    try { process.kill(zombie, 0); killSaysAlive = true } catch { /* absent */ }
+    expect(killSaysAlive).toBe(true) // the lie the old probe fell for
+    expect(processIsAlive(zombie)).toBe(false)
+  })
+
+  it('reports live and absent processes correctly for the liveness probe', () => {
+    const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 2000)'], { stdio: 'ignore' })
+    try {
+      if (child.pid === undefined) throw new Error('spawn did not yield a pid')
+      expect(processIsAlive(child.pid)).toBe(true)
+    } finally {
+      child.kill('SIGKILL')
+    }
+    expect(processIsAlive(process.pid)).toBe(true)
+    expect(processIsAlive(2_000_000_000)).toBe(false)
+  })
+
   it('rejects moving or deleting a task while any execution remains open', () => {
     const ledger = new HostTaskLedger(tempRoot(), () => NOW)
     ledger.applyRequest('create', { kind: 'create', id: 'task-a', input: { title: 'A', description: '', prompt: '' } })
@@ -205,5 +398,48 @@ describe('HostTaskLedger', () => {
       },
     })).toThrow('invalid schedule')
     expect(ledger.state().tasks).toEqual([])
+  })
+
+  it('persists scheduler heartbeats to a sidecar without rewriting the ledger document', () => {
+    const root = tempRoot()
+    const ledger = new HostTaskLedger(root, () => NOW)
+    ledger.applyRequest('create', { kind: 'create', id: 'task-a', input: { title: 'A', description: '', prompt: '' } })
+    const before = readFileSync(join(root, 'ledger-v2.json'), 'utf8')
+    ledger.setScheduler({ lastTickAt: NOW + 30_000 })
+    ledger.setScheduler({ lastTickAt: NOW + 60_000 })
+    expect(readFileSync(join(root, 'ledger-v2.json'), 'utf8')).toBe(before)
+    expect(readdirSync(root).filter(name => name.includes('.tmp-'))).toEqual([])
+    ledger.dispose()
+    const restarted = new HostTaskLedger(root, () => NOW + 61_000)
+    expect(restarted.state().scheduler.lastTickAt).toBe(NOW + 60_000)
+    restarted.dispose()
+  })
+
+  it('takes the newer of the document and sidecar heartbeat after restart', () => {
+    const root = tempRoot()
+    const ledger = new HostTaskLedger(root, () => NOW)
+    ledger.setScheduler({ lastTickAt: NOW + 30_000 })
+    ledger.applyRequest('create', { kind: 'create', id: 'task-a', input: { title: 'A', description: '', prompt: '' } })
+    // Full commit persists lastTickAt; a sidecar left over from an earlier
+    // crash must not roll it back, and a newer sidecar must win.
+    writeFileSync(join(root, 'scheduler-v2.json'), JSON.stringify({ lastTickAt: NOW - 5_000 }), 'utf8')
+    ledger.dispose()
+    const older = new HostTaskLedger(root, () => NOW + 31_000)
+    expect(older.state().scheduler.lastTickAt).toBe(NOW + 30_000)
+    older.dispose()
+    writeFileSync(join(root, 'scheduler-v2.json'), JSON.stringify({ lastTickAt: NOW + 90_000 }), 'utf8')
+    const newer = new HostTaskLedger(root, () => NOW + 91_000)
+    expect(newer.state().scheduler.lastTickAt).toBe(NOW + 90_000)
+    newer.dispose()
+  })
+
+  it('still commits non-heartbeat scheduler patches through the full document write', () => {
+    const root = tempRoot()
+    const ledger = new HostTaskLedger(root, () => NOW)
+    ledger.setScheduler({ error: 'visible after restart' })
+    ledger.dispose()
+    const restarted = new HostTaskLedger(root, () => NOW + 1_000)
+    expect(restarted.state().scheduler.error).toBe('visible after restart')
+    restarted.dispose()
   })
 })

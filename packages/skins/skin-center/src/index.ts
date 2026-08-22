@@ -1,10 +1,10 @@
 /**
  * Host half of the in-GUI skin center: mounts the `/api/skin-center/*` routes
- * the browser half uses for one-click apply / restore-official. Every switch
- * delegates to the `dsh-skin` CLI, which owns the `dsh-skin managed` section
- * of the active profile's `cordis.patch.yml` and the profile symlink; the DSH config
- * watcher hot-reloads the patch within seconds, so no restart is needed.
- * Try-on stays pure browser work (see src/client/try-on.ts).
+ * the browser half uses for the skin catalog, the active selection and
+ * one-click apply / restore-official (v2, issue #506). Skins are pure asset
+ * directories served through the safety pipeline; switching is a client-side
+ * atomic swap and never touches `cordis.patch.yml`. Try-on stays pure
+ * browser work (see src/client/runtime/skin-controller.ts).
  * @module @linxin666/dsh-client-ui-skin-center
  */
 
@@ -13,14 +13,32 @@ import { installSettingsSection, settingsNamespace } from '@deepseek-ai/dsh-sett
 import z from 'schemastery'
 // Type-only: pulls the dsh-host-webserver service seat (ctx.webServer).
 import type {} from '@deepseek-ai/dsh-host-webserver'
-import { makeSkinCenterRoutes, SKIN_CENTER_API_PREFIX } from './routes.ts'
-import { makeWeRoutes, WE_API_PREFIX } from './we-routes.ts'
+import { makeSkinCenterV2Routes } from './routes-v2.ts'
+import { makeSkinIndexRows, makeSkinIndexTap } from './tap-index-adapter.ts'
+import { defaultActiveStatePath, readActiveSelection } from './active-state.ts'
+import { migrateLegacySelection } from './legacy-bridge.ts'
+import { loadSkinCatalog } from './skin-repo.ts'
+import { makeWeRoutes } from './we-routes.ts'
 import { defaultWallpapersStoreDir } from './we-library.ts'
-import { resolveHarnessHome } from './skin-switch.ts'
+import { resolveHarnessHome } from './harness-home.ts'
 import { mountOnce } from './mount-once.ts'
+import {
+  CUSTOM_THEME_DEFAULTS,
+  CUSTOM_THEME_VERSION,
+  SKIN_CUSTOM_THEME_NS,
+  type CustomThemeConfig,
+} from './core/custom-theme.ts'
 
-export { makeSkinCenterRoutes, SKIN_CENTER_API_PREFIX } from './routes.ts'
+export { makeSkinCenterV2Routes, SKIN_CENTER_V2_PREFIX } from './routes-v2.ts'
 export { makeWeRoutes, WE_API_PREFIX } from './we-routes.ts'
+// The contract surface, re-exported for tooling (the dsh-skin CLI validates
+// and installs skin directories through these; never duplicate the logic).
+export { validateSkinManifestV2 } from './core/manifest-v2/validate.ts'
+export type { SkinManifestV2, SkinManifestValidation } from './core/manifest-v2/types.ts'
+export { transformSkinCss, SkinCssSafetyError } from './core/css-safety/transform.ts'
+export { loadSkinCatalog, findSkin, resolveInsideSkin, userSkinsDir, builtinSkinsDir } from './skin-repo.ts'
+export type { SkinCatalog, SkinCatalogEntry } from './skin-repo.ts'
+export { defaultActiveStatePath, readActiveSelection, writeActiveSelection } from './active-state.ts'
 
 /** Stable cordis plugin name (matches cordis.patch.yml insert id). */
 export const name = 'ui-skin-center'
@@ -34,6 +52,31 @@ export const inject = ['webServer']
  * scope without depending on this Host package.
  */
 export const SKIN_BACKGROUND_NAMESPACE = settingsNamespace('skin-background')
+
+/** Versioned settings namespace for the official-theme palette editor. */
+export const SKIN_CUSTOM_THEME_NAMESPACE = settingsNamespace(SKIN_CUSTOM_THEME_NS)
+
+export type SkinCustomThemeConfig = CustomThemeConfig
+
+const CustomThemeProfileSchema = z.object({
+  accent: z.string().default(CUSTOM_THEME_DEFAULTS.light.accent),
+  background: z.string().default(CUSTOM_THEME_DEFAULTS.light.background),
+  foreground: z.string().default(CUSTOM_THEME_DEFAULTS.light.foreground),
+  contrast: z.number().min(0).max(100).step(1).default(50),
+})
+
+/** Host-side persistence schema; browser normalization remains fail-closed. */
+export const SkinCustomThemeConfigSchema: z<SkinCustomThemeConfig> = z.object({
+  version: z.number().min(CUSTOM_THEME_VERSION).max(CUSTOM_THEME_VERSION).step(1).default(CUSTOM_THEME_VERSION),
+  applied: z.boolean().default(false),
+  light: CustomThemeProfileSchema.default(CUSTOM_THEME_DEFAULTS.light),
+  dark: z.object({
+    accent: z.string().default(CUSTOM_THEME_DEFAULTS.dark.accent),
+    background: z.string().default(CUSTOM_THEME_DEFAULTS.dark.background),
+    foreground: z.string().default(CUSTOM_THEME_DEFAULTS.dark.foreground),
+    contrast: z.number().min(0).max(100).step(1).default(50),
+  }).default(CUSTOM_THEME_DEFAULTS.dark),
+})
 
 /**
  * Plugin-configuration fields for the main-interface background, plus the
@@ -61,6 +104,8 @@ export interface SkinBackgroundConfig {
    * the with-content blur.
    */
   backgroundBlurContent?: number
+  /** Backdrop blur on the composer card while backdrop art is visible. */
+  inputCardBlur?: number
 }
 
 /**
@@ -72,6 +117,7 @@ export const SkinBackgroundConfigSchema: z<SkinBackgroundConfig> = z.object({
   backgroundOpacity: z.number().min(0).max(100).step(5).default(0),
   backgroundBlurEmpty: z.number().min(0).max(20).step(1).default(0),
   backgroundBlurContent: z.number().min(0).max(20).step(1).default(0),
+  inputCardBlur: z.number().min(0).max(20).step(1).default(10),
 })
 
 /**
@@ -102,6 +148,8 @@ export interface SkinWallpaperConfig {
   dim?: number
   /** Blur radius applied to the wallpaper itself, 0-60 px. */
   wallpaperBlur?: number
+  /** Sizing mode for live wallpapers: cover | contain | fill (stretch). */
+  fit?: 'cover' | 'contain' | 'fill'
 }
 
 /** Runtime schema for SkinWallpaperConfig. */
@@ -113,6 +161,7 @@ export const SkinWallpaperConfigSchema: z<SkinWallpaperConfig> = z.object({
   pauseOnHidden: z.boolean().default(true),
   dim: z.number().min(0).max(90).step(5).default(25),
   wallpaperBlur: z.number().min(0).max(60).step(1).default(0),
+  fit: z.union(['cover', 'contain', 'fill'] as const).default('cover'),
 })
 
 /**
@@ -136,6 +185,15 @@ function applyImpl(ctx: Context): void {
     onChange: () => { /* browser half re-applies on scope publish */ },
   })
 
+  installSettingsSection(ctx, SKIN_CUSTOM_THEME_NAMESPACE, SkinCustomThemeConfigSchema, {
+    ...CUSTOM_THEME_DEFAULTS,
+    light: { ...CUSTOM_THEME_DEFAULTS.light },
+    dark: { ...CUSTOM_THEME_DEFAULTS.dark },
+  }, {
+    setSource: () => { /* application is browser-side; value is read from the scope */ },
+    onChange: () => { /* browser half re-applies on scope publish */ },
+  })
+
   // The wallpaper bridge namespace; the host side keeps a live getter so
   // the /we routes see weLibraryDirs changes without a restart.
   let wallpaperSource: () => SkinWallpaperConfig = () => ({})
@@ -145,7 +203,7 @@ function applyImpl(ctx: Context): void {
   })
 
   const routes = [
-    ...makeSkinCenterRoutes(),
+    ...makeSkinCenterV2Routes(),
     ...makeWeRoutes({
       getConfig: () => wallpaperSource(),
       storeDir: defaultWallpapersStoreDir(resolveHarnessHome()),
@@ -156,6 +214,16 @@ function applyImpl(ctx: Context): void {
       const disposers: Array<() => void> = []
       try {
         for (const route of routes) disposers.push(ctx.webServer.register(route))
+        // The anti-FOUC seam (issue #506): contribute stylesheet links through
+        // DSH 0.1.1's structured table, then stamp html[data-dsh-skin] through
+        // the raw tap because the table cannot mutate the opening html tag.
+        const statePath = defaultActiveStatePath()
+        const indexDeps = { readActiveId: () => readActiveSelection(statePath) }
+        const collectSkinRows = makeSkinIndexRows(indexDeps)
+        disposers.push(ctx.on('webserver/index-inject', (table) => {
+          table.push(...collectSkinRows())
+        }))
+        disposers.push(ctx.webServer.tapIndex(makeSkinIndexTap(indexDeps)))
       } catch (error) {
         // Roll back whatever registered before the failure so a partial
         // mount never leaves half a route family live; the outer catch logs.
@@ -166,5 +234,23 @@ function applyImpl(ctx: Context): void {
     }, 'ui-skin-center: routes')
   } catch (error) {
     console.error('[ui-skin-center] route registration failed:', error)
+  }
+
+  // One-shot legacy bridge (issue #506): migrate the retired dsh-skin
+  // managed-section selection into the v2 store and strip the legacy rows.
+  // Idempotent and fail-closed. Notes go to the host log only when the
+  // bridge migrated, cleaned, or failed — the nothing-to-migrate steady
+  // state stays silent instead of logging on every boot (issue #788).
+  try {
+    const statePath = defaultActiveStatePath()
+    const knownIds = loadSkinCatalog().skins.map((s) => s.manifest.id)
+    const migration = migrateLegacySelection({ knownIds, activeStatePath: statePath })
+    if (migration.failed) {
+      for (const note of migration.notes) console.error(`[ui-skin-center] legacy bridge: ${note}`)
+    } else if (migration.migrated !== null || migration.patchCleaned) {
+      for (const note of migration.notes) console.info(`[ui-skin-center] legacy bridge: ${note}`)
+    }
+  } catch (error) {
+    console.error('[ui-skin-center] legacy bridge failed:', error)
   }
 }

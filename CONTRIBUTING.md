@@ -4,13 +4,29 @@
 入口；仓库的全部规则与机制以 [AGENTS.md](AGENTS.md)（及其分层指令）为准，
 冲突时以 AGENTS.md 为准。
 
+## 分支与合入流程
+
+- `dev` 是开发分支（集成分支）：本地开发与远程 PR 统一以 `dev` 为
+  目标分支；`dev` 上测试通过后，由维护者合入 `main`。
+- PR 打开后由 `.github/workflows/auto-assign-pr-reviewers.yml` 按 PR 描述中
+  勾选的「PR 类别」自动分派：把对应协作者设为负责人并请求其审查（渲染器 /
+  Wallpaper Engine / WebGL 相关 PR 由 Aa728848 负责并审查），路由规则见
+  [PR_TRIAGE.md](PR_TRIAGE.md)。
+- 合并门禁：`dev` / `main` 要求 3 个必需检查全绿，**不要求人工审批**；
+  具有 write 权限的协作者检查通过后即可自行合并（含自己的 PR），无需等待
+  维护者审批。
+- `main` 是稳定分支：只接收从 `dev` 合入且测试通过的代码。
+- 提 PR 一律以 `dev` 为 base，不要以 `main` 为 base。
+
 ## PR 范围：接受修复、增强与优化，暂不接受全新功能
 
 本仓库接受以下 PR：
 
 - **修复**：bug 修复、兼容性适配；
 - **增强 / 优化**：现有功能的改进、性能 / 体验优化、维护；
-- **新皮肤**：属于内容贡献，始终欢迎直接提 PR。
+- **新皮肤**：属于内容贡献，始终欢迎直接提 PR；但**低质皮肤 PR 不予接受**：
+  没有任何背景图、仅简单改色且样式存在明显问题（如暗色缺失、对比度不足、
+  布局错位）的皮肤，请完善样式并附试穿截图后再提交。
 
 暂**不接受**全新特性 / 新功能的 PR；有相关需求请先在
 [Issues](https://github.com/zhu1090093659/dsh-web-ui/issues) 提 issue 讨论，
@@ -32,6 +48,8 @@
 ```sh
 git clone https://github.com/zhu1090093659/dsh-web-ui.git
 cd dsh-web-ui
+git checkout dev                                 # 开发基线：dev 分支
+git fetch origin && git rebase origin/dev        # 提交 / 提 PR 前同步最新 dev
 pnpm install
 pnpm -r build
 pnpm typecheck && pnpm test && pnpm docs:check   # 提交前必过
@@ -59,8 +77,14 @@ pnpm docs:write-pair <包目录名>   # 如 dsh-ssh 或 xp
 3. **无 emoji**：代码、注释、文档、提交信息均不得出现 emoji（CI 有全树
    检查）。
 4. **一次性记录**（任务交接、验证快照）放 `docs/archive/`，不进长期文档目录。
-5. **按模板填 PR**：摘要、涉及包、类型、最新代码确认、AI 编码披露、仓库
-   规范检查、本地验证结果；用户可见功能变更附截图 / 视频证据。
+5. **按模板填 PR**：摘要、涉及包、**PR 类别（必填，决定自动分派给哪位
+   协作者）**、类型、最新代码确认、AI 编码披露、仓库规范检查、本地验证结果；**测试证据与上游同步必填**：提供自己本地测试
+   的证据，并附上同步上游最新 `dev` 分支（`git fetch origin && git
+   rebase origin/dev`）后重新测试通过的证据。文本类改动可不附截图；
+   **视觉修复 / 用户可见变更必须附截图**（视觉修复还需完成态或修复前后
+   对比截图），且视觉修复必须使用支持图像输入的多模态 AI 模型完成——
+   使用纯文本模型（如 deepseek-chat / deepseek-reasoner / gpt-3.5）修复
+   的视觉类 PR 不予接受。缺少上述证据的 PR 不予接受。
 6. **AI 编码披露**：使用 AI 编码时在 PR 模板中如实披露模型与工具。
 
 ## 新增包或皮肤

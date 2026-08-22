@@ -19,10 +19,12 @@
 | 直接发图 | 在纯文本会话里拖拽或粘贴图片，发送时被改写为自描述 describe-image 引用（`![图片](/describe-image/raw/sha256:...?ref=...)`），而不是模型读不了的图片块——图片在会话里正常渲染，模型经工具分析它。支持图片输入的模型（适配器声明 image 模态）会被自动识别：原图块直接交给模型本身的视觉，不再绕行 describe_image，且该会话的 `describe_image` 工具会被隐藏——多模态模型看不到、也无法调用它（包括 run_code 内的嵌套调用） |
 | 自定义指令 | `prompt` 参数携带你的精确指令（OCR、图表解读、UI 诊断、翻译…）；`defaultPrompt` 配置设置模型未传指令时的兜底文案 |
 | 实时配置卡 | 设置 → 插件配置 → Web UI 插件组 → 「图像理解」卡修改 `baseURL` / `apiStyle` / `model` / API key / 默认指令 / 各项上限（走设置服务），即时生效，无需重启 |
-| 多协议 | `apiStyle: chat-completions`（默认）请求 `baseURL/chat/completions`；`apiStyle: responses` 请求 `baseURL/responses`，使用 `input` / `max_output_tokens` 并读取 `output_text`；`apiStyle: anthropic-messages` 请求 `baseURL/v1/messages`（`x-api-key` 鉴权，Claude 风格端点如 OpenCode Go / 智谱 GLM / 月之暗面 Kimi），读取 `content[].text` |
+| 连通测试与模型获取 | 模型字段带「获取模型」控件，模型字段有值时再出现「测试连通性」控件，两者未保存也可用。获取把草稿提交到 `POST /describe-image/models`，Host 侧按密钥解析链解析凭证、只回模型 id 列表；列出成功即端点可达且鉴权通过，模型字段随之切换为已获取模型的下拉选择。测试连通性用所选模型发一次最小补全（`max_tokens` 1），回报模型本身的往返延迟 |
+| 多协议 | `apiStyle: chat-completions`（默认）请求 `baseURL/chat/completions` 并读取 `message.content`，content 为空时回退 `reasoning_content`（推理模型如 Kimi K2.x 可能把全部输出预算花在思维链上——issue #637；调大 `maxOutputTokens` 或用 `model:off` 可避免）；`apiStyle: responses` 请求 `baseURL/responses`，使用 `input` / `max_output_tokens` 并读取 `output_text`，兼容只返回 SSE 流式响应的端点（自动解析 `text/event-stream`）；`apiStyle: anthropic-messages` 请求 `baseURL/v1/messages`（`x-api-key` 鉴权，Claude 风格端点如 OpenCode Go / 智谱 GLM / 月之暗面 Kimi），读取 `content[].text` |
 | 思考控制 | 模型 id 带可选后缀：`model:off` 禁用思考，`model:low` / `model:medium` / `model:high` 开启思考；不带后缀则不发送控制、沿用端点默认（MiMo-V2.5、DeepSeek V4 默认开启思考） |
 | 原图路由 | `GET /describe-image/raw/<id>` 回读已存字节（仅回环、内容寻址 id），让贴入的引用在会话中渲染 |
 | 能力探测路由 | `GET /describe-image/capability?session=<id>` 回答该会话模型是否声明图片输入（以会话自身的请求头路由确认生效模型——恢复的会话沿用其日志模型、无请求历史的新会话取当前默认模型选择；模态经 `resolveModelInfo` 精确解析）。无路由可解析、一切未知与失败都保守回答 false，保留改写行为 |
+| 原生图片开关 | rc.8：设置卡的「原生图片请求」区报告当前默认模型的图片输入状态，并经回环路由 `GET` / `POST /describe-image/native-images` 切换 DeepSeek 适配器模型目录条目（`llm-deepseek` 设置命名空间里的 `inputModalities`）。启用：发送的图片原生交给模型、`describe_image` 从该模型的工具集中隐藏；停用：沿用改写路径。未挂载适配器命名空间的宿主显示不支持提示 |
 | 每次调用解析密钥 | 内联 `apiKey` → 凭证服务（`apiKeyEnv`，默认 `VISION_API_KEY`）→ 启动环境，逐级回退 |
 | 安全与边界 | 所有请求拒绝重定向；`maxBytes` / `maxOutputTokens` / `timeoutMs` 上限；magic-byte 类型门；错误摘要有界（200 字符）；密钥不进日志 |
 | 返回规范值 | `{ text, model, image, mimeType, bytes }`——模型只看到 `text` |
@@ -36,6 +38,13 @@
 - attach 路由先校验 base64、magic bytes 与字节上限，再交给附件存储持久化；
   只有引用 JSON（文本）进入会话。
 - 响应体先按上限（`maxOutputTokens * 8 + 64 KiB`）截断再解析。
+- 模型探测的密钥留在 Host：浏览器侧只提交连接字段草稿、只接收模型 id 列表
+  或延迟数字；获取只做一次 `GET` 模型列举，连通性测试只发一次 `max_tokens` 1
+  的最小补全，消耗一个输出 token。
+- 模型探测路由仅接受回环同源请求（共享 `host/loopback` 围栏，与 dsh-ssh 同款）：
+  跨站页面无法把已存密钥引向攻击者控制的 URL。
+- 原生图片开关路由同受回环同源围栏：只经宿主设置服务写入官方 `llm-deepseek`
+  模型目录（revision 栅栏、适配器 schema 校验），绝不接触凭证。
 
 ## 安装
 
@@ -43,7 +52,7 @@
 
 ```sh
 # 推荐：直接从 npm 安装
-dsh plugin --profile web add @linxin666/dsh-tool-describe-image
+dsh plugin --profile web add @linxin666/dsh-tool-describe-image@latest
 ```
 
 聚合包默认**无配置挂载**本插件：加载不受影响，首次调用会以清晰的错误提示
@@ -57,7 +66,7 @@ dsh plugin --profile web add @linxin666/dsh-tool-describe-image
 | 键 | 默认 | 含义 |
 | --- | --- | --- |
 | `baseURL` | —（必填） | 端点根地址，按协议追加路径（`/chat/completions`、`/responses` 或 `/v1/messages`）。OpenAI 兼容端点如 `https://dashscope.aliyuncs.com/compatible-mode/v1`；Anthropic 风格可填写 provider 根地址（如 `https://opencode.ai/zen/go`）、常规 `/v1` API 根地址或完整 `/v1/messages` 端点。末尾斜杠自动去除 |
-| `apiStyle` | `chat-completions` | 接口协议：`chat-completions` 追加 `/chat/completions`；`responses` 追加 `/responses`（OpenAI Responses API 的 `input` / `max_output_tokens` / `output_text` 形态）；`anthropic-messages` 将地址规范化为唯一的 `/v1/messages` 端点（Claude 风格 `messages` / `max_tokens` / `content[].text`，`x-api-key` + `anthropic-version` 头） |
+| `apiStyle` | `chat-completions` | 接口协议：`chat-completions` 追加 `/chat/completions`；`responses` 追加 `/responses`（OpenAI Responses API 的 `input` / `max_output_tokens` / `output_text` 形态；兼容只返回 SSE 流式响应的端点，自动解析 `text/event-stream`）；`anthropic-messages` 将地址规范化为唯一的 `/v1/messages` 端点（Claude 风格 `messages` / `max_tokens` / `content[].text`，`x-api-key` + `anthropic-version` 头） |
 | `model` | —（必填） | 视觉模型 id，可带思考后缀（`:off` / `:low` / `:medium` / `:high`）。后缀在发往端点前剥除：`:off` 映射为 `thinking.type=disabled`（`chat-completions`）或 `reasoning.effort=none`（`responses`）；其余档位映射为 `enabled`，或原样作为 `reasoning.effort` 的值。不带后缀则不发送任何思考控制字段；`anthropic-messages` 协议不发送思考字段，保持端点自身默认 |
 | `apiKey` | — | 内联密钥；本地调试用。建议用 `!!js process.env.VISION_API_KEY` 从环境注入，勿写死明文 |
 | `apiKeyEnv` | `VISION_API_KEY` | 凭证引用（环境变量名）；空字符串禁用引用解析 |
@@ -140,13 +149,24 @@ DSH 输入框对纯文本模型没有图片入口，因此在输入框里拖拽�
 默认开)。当其他视觉插件与当前会话共用、需要由它们接收原始图片块时请关闭；关闭后图片发送
 原样放行。
 
+### 原生图片请求（rc.8）
+
+DeepSeek chat-completions 适配器（rc.8）在模型目录条目的 `inputModalities` 包含 `image` 时
+把图片块原生发给模型，而官方模型设置界面未暴露该字段。设置卡的「原生图片请求」区补齐这个入口：
+它显示当前默认模型的图片输入判定，并提供开关经官方设置服务改写 `llm-deepseek` 设置命名空间
+（schema 校验、revision 栅栏与持久化仍由宿主负责）。启用后，默认模型原生接收发送的图片，
+`describe_image` 从该模型的工具集中隐藏；停用则沿用 describe-image 改写路径。两条路由仅限回环
+访问，同源围栏与附件路由一致；浏览器永远接触不到凭证。
+
 ## 已知限制
 
 - 仅 magic-byte 门校验类型、不解码图片：头合法但内容损坏的文件会在视觉端点才报错。
 - 单图单答：不支持多图输入、追问上一张图、结构化输出（坐标 / 框）。
 - 抽取文本仍消耗一次 VLM 调用：仅需 OCR 的部署可把 `baseURL` 指向更便宜的 OCR 模型。
 - 支持三种协议：Chat Completions（`/chat/completions`）、Responses（`/responses`）、
-  Anthropic Messages（`/v1/messages`，`x-api-key` 鉴权）——其他请求/响应形态的厂商需要单独的适配器。
+  Anthropic Messages（`/v1/messages`，`x-api-key` 鉴权）。Responses 协议额外兼容只返回
+  SSE 流式响应的端点（`text/event-stream`，如 codex-lb 风格中继）；其他请求/响应形态的
+  厂商需要单独的适配器。
 - 模型思考后缀是插件简写，会向请求注入厂商专用字段（`thinking.type` / `reasoning.effort`）；
   不接受这些字段的端点（如普通 OpenAI 视觉模型）应使用不带后缀的模型 id。chat-completions
   协议没有 effort 档位，`:low` / `:medium` / `:high` 在该协议下都映射为 `thinking.type=enabled`。

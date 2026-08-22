@@ -72,16 +72,24 @@ export function HostsTab({ api, onConnect }: HostsTabProps) {
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({})
   const [testingGroup, setTestingGroup] = useState<string | null>(null)
   const seqRef = useRef(0)
+  // Unmount guard for the async load below: the seq check only orders
+  // overlapping loads, it does not stop a late resolution/rejection landing
+  // after the tab unmounted — a setState there races the test-environment
+  // teardown (window is not defined; observed as a main-CI flake). The
+  // sibling tabs (terminal / transfer / tunnels) already guard with a
+  // disposed flag.
+  const mountedRef = useRef(true)
+  useEffect(() => () => { mountedRef.current = false }, [])
 
   const load = useCallback(async (query?: string): Promise<void> => {
     const seq = ++seqRef.current
     try {
       const list = await api.listHosts(query)
-      if (seq !== seqRef.current) return
+      if (!mountedRef.current || seq !== seqRef.current) return
       setHosts(list)
       setError(null)
     } catch (cause) {
-      if (seq !== seqRef.current) return
+      if (!mountedRef.current || seq !== seqRef.current) return
       setError(errorMessage(cause))
     }
   }, [api])
@@ -97,15 +105,21 @@ export function HostsTab({ api, onConnect }: HostsTabProps) {
     return () => { clearTimeout(timer) }
   }, [search, load])
 
+  // Every async setState path guards with mountedRef, not just load(): a
+  // promise settling after unmount would setState against the torn-down
+  // environment (window is not defined, main-CI flake).
   const runTest = async (alias: string): Promise<void> => {
+    if (!mountedRef.current) return
     setTestingAlias(alias)
     try {
       const result = await api.testHost(alias)
+      if (!mountedRef.current) return
       setTestResults(prev => ({ ...prev, [alias]: result }))
     } catch (cause) {
+      if (!mountedRef.current) return
       setTestResults(prev => ({ ...prev, [alias]: { ok: false, error: errorMessage(cause) } }))
     } finally {
-      setTestingAlias(null)
+      if (mountedRef.current) setTestingAlias(null)
     }
   }
 
@@ -113,32 +127,38 @@ export function HostsTab({ api, onConnect }: HostsTabProps) {
     if (!window.confirm(tt('hosts.deleteConfirm', { alias }))) return
     try {
       await api.deleteHost(alias)
+      if (!mountedRef.current) return
       void load()
     } catch (cause) {
+      if (!mountedRef.current) return
       setError(errorMessage(cause))
     }
   }
 
   // Group-header batch action (#379): test every host in the group.
   const testGroup = async (group: HostGroup): Promise<void> => {
+    if (!mountedRef.current) return
     setTestingGroup(group.key)
     try {
       await Promise.all(group.hosts.map(host => runTest(host.alias)))
     } finally {
-      setTestingGroup(null)
+      if (mountedRef.current) setTestingGroup(null)
     }
   }
 
   const importConfig = async (): Promise<void> => {
+    if (!mountedRef.current) return
     setImporting(true)
     try {
       const result = await api.importSshConfig()
+      if (!mountedRef.current) return
       setNotice(tt('hosts.imported', { parsed: result.parsed, added: result.added, skipped: result.skipped }))
       void load()
     } catch (cause) {
+      if (!mountedRef.current) return
       setError(errorMessage(cause))
     } finally {
-      setImporting(false)
+      if (mountedRef.current) setImporting(false)
     }
   }
 
@@ -149,7 +169,7 @@ export function HostsTab({ api, onConnect }: HostsTabProps) {
         <td className={css.mono}>{host.alias}</td>
         <td className={css.mono}>{host.host}:{host.port}</td>
         <td>{host.user}</td>
-        <td><span className={css.badge} data-kind={host.auth}>{host.auth === 'key' ? tt('form.auth.key') : tt('form.auth.password')}</span></td>
+        <td><span className={css.badge} data-kind={host.auth}>{host.auth === 'key' ? tt('form.auth.key') : host.auth === 'password' ? tt('form.auth.password') : tt('form.auth.agent')}</span></td>
         <td className={css.cellMuted}>{host.environment ?? ''}</td>
         <td className={css.cellMuted}>{host.tags.join(', ')}</td>
         <td className={css.cellMuted}>{host.description ?? ''}</td>

@@ -35,10 +35,10 @@ Plan mode is supported: phase 1 filters the assembled prompt sections down to th
 
 ```sh
 # Option 1: family bundle (recommended)
-dsh plugin --profile web add @linxin666/dsh-web-ui-all
+dsh plugin --profile web add @linxin666/dsh-web-ui-all@latest
 
 # Option 2: standalone
-dsh plugin --profile web add @linxin666/dsh-liangshen
+dsh plugin --profile web add @linxin666/dsh-liangshen@latest
 
 # Pick ONE of the two: the bundle and the standalone @linxin666/dsh-liangshen
 # both mount this preset. If you switch between them, remove the other first:
@@ -52,7 +52,7 @@ Fully restart `dsh web`, open a NEW empty session, and pick "梁神模式" as th
 Export the session JSONL and inspect `request/header`:
 
 - The first header should carry only `bash/str_replace_editor` (the persistent shell plus the sandboxed editor);
-- The first turn should contain only the user's own messages — no workspace-instruction baseline, no runtime snapshot, no skill-catalog message — and only the `deployment:persona` prompt section;
+- The first turn should contain only whitelisted source kinds (the user's own messages and `/goal` auto-round messages) — no workspace-instruction baseline, no runtime snapshot, no skill-catalog message — and only the `deployment:persona` prompt section;
 - After the first tool call, the next changed header should carry exactly `run_code` (PTC); the runtime snapshot and all prompt sections arrive with that step (including plan mode's `plan:policy`, and the persona now ends with the selected workspace path), and the workspace instructions and skill catalog arrive one step later;
 - Phase-1 editor writes obey the host file sandbox policy — there is no bare local-filesystem bypass;
 - Later requests keep `run_code`.
@@ -62,6 +62,15 @@ Trajectory drift can be measured without reading raw reasoning:
 ```sh
 node tools/analyze-session.mjs ~/.dsh/sessions/<workspace>/<session>/session.jsonl
 ```
+
+## Configuration
+
+| Key | Default | Behavior |
+| --- | --- | --- |
+| `enabled` | `true` | Master switch: when false, neither preset sync nor announcement runs. |
+| `announceToAgent` | `false` | Opt-in: when true, a system-prompt section announces the plugin. Off by default so agent system prompts stay clean. |
+
+Both fields are editable in the web settings surface (plugin config, live) or through the profile patch (`dsh plugin` / `cordis.patch.yml`).
 
 ## Behavior and limits
 

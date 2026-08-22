@@ -18,7 +18,7 @@
 - **确定性恢复**：已有 session id 的 running execution 在重启后继续观察；没有 session id 的启动中断会取消且不会重发。
 - **实时同步**：变更返回完整 revision snapshot；SSE 只提示 revision、scheduler 与 power 变化，重连和页面恢复可见时重新拉完整 snapshot。
 - **可选空闲睡眠保护**：默认关闭；开启后覆盖全部运行中的 DSH 会话、已启用且未归档的任务计划和未知会话状态。
-- **系统提示词注入**：Host 通过 `SystemPrompt.section` 注册 order 200 的 `plugin:task-board` 段；任务看板设置可单独关闭声明而不关闭看板。
+- **系统提示词注入**：Host 通过 `SystemPrompt.section` 注册 order 200 的 `plugin:task-board` 段；任务看板设置可单独关闭声明而不关闭看板。该提示也会提醒 agent 在最终回复前收尾可见的 `todo_write` 计划列表。
 
 ## 架构与协议
 
@@ -34,7 +34,7 @@
 安装聚合包或单独安装本包，然后重启 `dsh web`：
 
 ```sh
-dsh plugin --profile web add @linxin666/dsh-client-ui-task-board
+dsh plugin --profile web add @linxin666/dsh-client-ui-task-board@latest
 ```
 
 本地开发安装：
@@ -52,7 +52,7 @@ dsh plugin --profile web add link:$(pwd)/packages/dsh-task-board
 | 键 | 默认值 | 行为 |
 | --- | --- | --- |
 | `enabled` | `true` | 启用 Host 服务与浏览器看板。 |
-| `announceToAgent` | `true` | 向 agent 系统提示加入任务看板说明。 |
+| `announceToAgent` | `false` | 按需开启：开启后向 agent 系统提示加入任务看板说明。 |
 | `preventIdleSleep` | `false` | 存在运行中的 DSH 会话、已启用计划或未知会话状态时，持有一个系统空闲睡眠断言。 |
 | `trustedProxyHosts` | `[]` | 仅通过已认证 loopback 反向代理路径接受的规范 `host[:port]` authority 白名单。 |
 | `proxyTokenEnv` | `DSH_TASK_BOARD_PROXY_TOKEN` | 保存反向代理 token 的环境变量名；token 本身不会写入插件配置。 |

@@ -12,7 +12,7 @@ import { createPortal } from 'react-dom'
 import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import type { PairingPhase } from '../pairing.ts'
 import { RemotePanel, type PanelState } from './RemotePanel.tsx'
-import { copyText, issuePair, stopPair, type IssueResponse, type PairStateFrame, type TunnelStatusFrame } from './pair-api.ts'
+import { copyText, issuePair, revokePair, stopPair, type DeviceFrame, type IssueResponse, type PairStateFrame, type TunnelStatusFrame } from './pair-api.ts'
 import { PhoneIcon } from './PhoneIcon.tsx'
 import { UpdateEntry } from './UpdateEntry.tsx'
 import css from './remote.module.css'
@@ -38,7 +38,9 @@ function mergeFrame(state: PanelState, frame: PairStateFrame): PanelState {
     phase: frame.phase,
     deviceCount: frame.deviceCount,
     onlineCount: frame.onlineCount,
+    devices: frame.devices ?? [],
     ...(frame.tunnel !== undefined ? { tunnel: frame.tunnel as TunnelStatusFrame } : {}),
+    ...(frame.posture !== undefined ? { posture: frame.posture } : {}),
   }
 }
 
@@ -55,8 +57,12 @@ export function RemoteEntry({ wide, useWorkspaces, t }: RemoteEntryProps) {
   // pure), so mint decisions read this ref instead.
   const stateRef = useRef(state)
   useEffect(() => { stateRef.current = state }, [state])
-  const [copied, setCopied] = useState(false)
+  const [copied, setCopied] = useState<'phone' | 'desktop' | undefined>(undefined)
   const eventSource = useRef<EventSource | undefined>(undefined)
+  // Generation counter for the open flow: closing (or re-opening) the panel
+  // bumps it, so an in-flight issue() that resolves after a close does not
+  // spawn a stray EventSource.
+  const openSeq = useRef(0)
 
   // The current workspace (the recent-workspace projection the shell's New
   // Session flow targets) — the deep-link target for the phone.
@@ -93,6 +99,7 @@ export function RemoteEntry({ wide, useWorkspaces, t }: RemoteEntryProps) {
       phase: 'waiting',
       deviceCount: 0,
       onlineCount: 0,
+      devices: [] as DeviceFrame[],
       // Whether this QR is built on the configured public (tunneled) base.
       public: publicBaseUrl !== undefined && result.url.startsWith(publicBaseUrl),
       ...(publicBaseUrl !== undefined ? { publicBaseUrl } : {}),
@@ -104,8 +111,13 @@ export function RemoteEntry({ wide, useWorkspaces, t }: RemoteEntryProps) {
   }, [workspaceId])
 
   const openPanel = useCallback(async (): Promise<void> => {
+    const seq = ++openSeq.current
     setOpen(true)
     const next = await mint()
+    // A close (or re-open) during the await invalidates this issue: skip the
+    // state write and the stream so a panel closed mid-mint neither leaks an
+    // EventSource nor resurrects a stale QR.
+    if (seq !== openSeq.current) return
     setState(next)
     // Live status: the desktop panel mirrors the pairing service state. The
     // stream makes sense in the ready state and on the lan-required banner —
@@ -143,6 +155,7 @@ export function RemoteEntry({ wide, useWorkspaces, t }: RemoteEntryProps) {
   }, [mint])
 
   const closePanel = useCallback(() => {
+    openSeq.current += 1
     closeEventSource()
     setOpen(false)
   }, [closeEventSource])
@@ -170,7 +183,14 @@ export function RemoteEntry({ wide, useWorkspaces, t }: RemoteEntryProps) {
     // keeps the UI honest, and the status stream confirms the stopped phase.
     void stopPair().catch(() => {})
     // Optimistic fallback; the status stream confirms with the stopped phase.
-    setState(previous => previous.kind === 'ready' ? { ...previous, phase: 'stopped' as PairingPhase } : previous)
+    setState(previous => previous.kind === 'ready' ? { ...previous, phase: 'stopped' as PairingPhase, devices: [] } : previous)
+  }, [])
+
+  const handleRevoke = useCallback((deviceId: string) => {
+    void revokePair(deviceId).catch(() => {})
+    setState(previous => previous.kind === 'ready'
+      ? { ...previous, devices: previous.devices.filter(device => device.id !== deviceId) }
+      : previous)
   }, [])
 
   const handleRefresh = useCallback(() => {
@@ -187,20 +207,19 @@ export function RemoteEntry({ wide, useWorkspaces, t }: RemoteEntryProps) {
     void mint().then(setState)
   }, [mint])
 
-  const handleCopy = useCallback(() => {
-    if (state.kind !== 'ready') return
-    void copyText(state.url).then((ok) => {
+  const handleCopy = useCallback((target: 'phone' | 'desktop', url: string) => {
+    void copyText(url).then((ok) => {
       if (!ok) return
-      setCopied(true)
-      window.setTimeout(() => { setCopied(false) }, 1500)
+      setCopied(target)
+      window.setTimeout(() => { setCopied(undefined) }, 1500)
     })
-  }, [state])
+  }, [])
 
   return (
     <>
       <div className={css.entryRow} data-rail={wide ? undefined : 'rail'}>
         <UpdateEntry wide={wide} t={t} />
-        <TooltipAnchor wide={wide} label={t('entry.label')} onClick={openPanel} />
+        <TooltipAnchor wide={wide} label={t('entry.label')} onClick={openPanel} expanded={open} />
       </div>
       {open && createPortal((
         <div className={css.overlay} role="presentation">
@@ -215,6 +234,7 @@ export function RemoteEntry({ wide, useWorkspaces, t }: RemoteEntryProps) {
             onCopy={handleCopy}
             onPickAddress={handlePickAddress}
             onPickPublic={handlePickPublic}
+            onRevoke={handleRevoke}
           />
         </div>
       ), document.body)}
@@ -223,13 +243,14 @@ export function RemoteEntry({ wide, useWorkspaces, t }: RemoteEntryProps) {
 }
 
 /** The trigger: an icon-only control with a persistent accessible label. */
-function TooltipAnchor({ wide, label, onClick }: { wide: boolean; label: string; onClick: () => void }) {
+function TooltipAnchor({ wide, label, onClick, expanded }: { wide: boolean; label: string; onClick: () => void; expanded: boolean }) {
   return (
     <button
       type="button"
       className={css.trigger}
       data-wide={wide ? 'wide' : 'rail'}
       aria-label={label}
+      aria-expanded={expanded}
       title={label}
       onClick={onClick}
     >

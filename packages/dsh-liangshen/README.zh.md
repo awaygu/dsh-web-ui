@@ -8,7 +8,7 @@
 
 DeepSeek V4 Pro 会强烈依赖 API 中可见的**首轮工具目录**选择执行轨迹。社区评测（[xiaobright/modeltest](https://github.com/xiaobright/modeltest)）中，Standard / PTC 只有 91/92 分，Minimal 达到 99/96，但 Minimal 只有两个工具。两阶段方案把「首次轨迹选择」与「后续完整工具能力」拆开：
 
-1. 首轮模型请求只暴露官方 Minimal 精确双工具（持久 `bash` 与 `str_replace_editor`），只保留 `deployment:persona` 一个 prompt section，清空运行时上下文，并且只放行用户自己的消息；
+1. 首轮模型请求只暴露官方 Minimal 精确双工具（持久 `bash` 与 `str_replace_editor`），只保留 `deployment:persona` 一个 prompt section，清空运行时上下文，并且只放行白名单内的消息（用户自己的消息与 `/goal` 自动轮次消息）；
 2. 会话出现首次持久 `tool/call` 后，晋升会等到首个 reasoning 块呈 minimal-like（包含 `we` 且无 `let me`）才发生，四步兜底；随后 wire 切换为 PTC Mode——只暴露一个 `run_code`，完整工具注册表通过生成的 SDK 调用——并恢复全部 prompt section（含 plan mode 的 `plan:policy`）以及 workspace 指令、skill 目录与运行时快照等常规注入；
 3. 阶段从持久化 session events 推导，resume / reload 不丢失状态。
 
@@ -35,10 +35,10 @@ preset 在参考机制之上内置了额外保护，全部在 `agent.cordis.yml`
 
 ```sh
 # 方式一：全家桶（推荐）
-dsh plugin --profile web add @linxin666/dsh-web-ui-all
+dsh plugin --profile web add @linxin666/dsh-web-ui-all@latest
 
 # 方式二：单独安装
-dsh plugin --profile web add @linxin666/dsh-liangshen
+dsh plugin --profile web add @linxin666/dsh-liangshen@latest
 
 # 两种方式二选一：聚合包与独立 @linxin666/dsh-liangshen 都会挂载本 preset。
 # 需要在两者之间切换时，先 dsh plugin remove 移除另一个再安装：
@@ -62,6 +62,15 @@ dsh plugin --profile web remove @linxin666/dsh-liangshen
 ```sh
 node tools/analyze-session.mjs <导出的 session.jsonl>
 ```
+
+## 配置
+
+| 键 | 默认值 | 行为 |
+| --- | --- | --- |
+| `enabled` | `true` | 总开关：关闭后预设同步与公告都不执行。 |
+| `announceToAgent` | `false` | 按需开启：开启后向 agent 系统提示注入本插件公告。默认关闭，保持系统提示词干净。 |
+
+两个字段都可在 Web 设置界面（插件配置，即时生效）或 profile patch（`dsh plugin` / `cordis.patch.yml`）中编辑。
 
 ## 行为与限制
 

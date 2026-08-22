@@ -1,7 +1,7 @@
 /**
  * Task-board settings for availability, agent announcement, and optional Host
- * idle-sleep protection. Registers into the `settings.plugin.item` slot the
- * plugin-configuration section renders, bound to the `task-board` namespace.
+ * idle-sleep protection. Registers into the `web-ui.plugin.item` child slot
+ * the Web UI plugin group renders, bound to the `task-board` namespace.
  */
 
 import type { InjectFace, PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
@@ -97,20 +97,20 @@ export function TaskBoardSettingsCard(props: TaskBoardSettingsCardProps) {
   const disabled = !state.writable
   const [power, setPower] = useState<TaskBoardPowerSnapshot | undefined>()
   useEffect(() => {
+    // The SSE channel already carries power on every real change and pushes
+    // one frame on subscribe; polling the full /state snapshot every 5 s
+    // re-cloned and re-serialized the whole ledger server-side for one field.
     let live = true
-    const refresh = async (): Promise<void> => {
+    const events = new EventSource('/api/task-board/events')
+    events.onmessage = (message: MessageEvent<string>): void => {
       try {
-        const response = await fetch('/api/task-board/state', { cache: 'no-store', credentials: 'same-origin' })
-        if (!response.ok) return
-        const snapshot = await response.json() as { power?: TaskBoardPowerSnapshot }
-        if (live) setPower(snapshot.power)
+        const frame = JSON.parse(message.data) as { power?: TaskBoardPowerSnapshot }
+        if (frame.power !== undefined && live) setPower(frame.power)
       } catch {
         // The settings form remains usable while the host status is reconnecting.
       }
     }
-    void refresh()
-    const timer = setInterval(() => { void refresh() }, 5_000)
-    return () => { live = false; clearInterval(timer) }
+    return () => { live = false; events.close() }
   }, [])
   const fieldProps = {
     overriddenLabel: t('settings.overridden'),

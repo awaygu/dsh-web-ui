@@ -1,6 +1,2 @@
-//#region src/index.ts
-/** Host loader entry for the browser-only Windows XP-style skin plugin. */
-/** Provides no host-side behavior. */
-function apply() {}
-//#endregion
-export { apply };
+/** Retired v1 skin compatibility shim. */
+export function apply() {}

@@ -28,9 +28,17 @@ import type { PairingService } from './pairing.ts'
 import { readBoundedJson, writeJson } from './http.ts'
 import { readCookie } from './gate.ts'
 
-/** Methods the phone surface may call. Everything else is refused. */
+/**
+ * Methods the phone surface may call. Everything else is refused HERE — but
+ * note the paired-device cookie also passes the global api/gate for the full
+ * ApiProxy surface (gate.ts), so a paired phone is a full-control credential:
+ * the allowlist only constrains this /m/api proxy, not the cookie's reach.
+ * stop() revokes every device; the loopback panel can also revoke one
+ * device at a time.
+ */
 const MOBILE_ALLOWLIST = new Set([
   'workspace.list',
+  'agentPreset.list',
   'session.create',
   'session.list',
   'session.history',
@@ -252,7 +260,10 @@ async function dispatch(apiProxy: ApiProxy, method: string, payload: unknown, rp
   const request: RpcRequest<unknown> = { rpcId: RpcId(rpcId), payload }
   if (method === 'session.list') {
     const full = await apiProxy.sessions.list(request as never)
-    if (!full.result.ok) return full
+    // The error path must carry the same 'server-response' envelope the
+    // success path builds, or the phone's callUnary throws a transport error
+    // and masks the real business error.
+    if (!full.result.ok) return { type: 'server-response' as const, rpcId, result: full.result }
     const items = full.result.value.items as Array<{ updatedAt: number; sessionId: string }>
     const cursor = (payload as { cursor?: string } | undefined)?.cursor
     // Every call pages (the first call with no cursor IS the first page):
@@ -292,6 +303,7 @@ async function dispatch(apiProxy: ApiProxy, method: string, payload: unknown, rp
     result: response.result,
   })
   if (method === 'workspace.list') return wrap(await apiProxy.workspace.list(request as never))
+  if (method === 'agentPreset.list') return wrap(await apiProxy.agentPresets.list(request as never))
   if (method === 'session.create') return wrap(await apiProxy.sessions.create(request as never))
   if (method === 'session.history') return wrap(await apiProxy.sessions.history(request as never))
   if (method === 'session.search') return wrap(await apiProxy.sessions.search(request as never, signal ?? new AbortController().signal))

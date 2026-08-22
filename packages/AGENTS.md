@@ -33,11 +33,19 @@
   `shared/`，包内同名文件是 `scripts/sync-shared.mjs` 生成的同步副本
   （generated 头注释，禁止手改；改 shared 源后重跑同步，test:scripts 含 drift 门禁）。
 - **浏览器 bundle 纯度门**：`@deepseek-ai/*` 只能 type-only 导入；值导入只允许
-  平台种子表成员（react / cordis / ui-slots / web-react / ui-primitives /
-  schema-form，见 `shared/web-platform.ts`）。跨插件协作走 cordis 服务
+  平台种子表成员（react / cordis / ui-slots / ui-primitives，见
+  `shared/web-platform.ts`）。跨插件协作走 cordis 服务
   （`ctx.slots` / `ctx.sessions` / `ctx.workspaces`）或 slot，不走 value import。
 - **样式**：CSS Modules（`*.module.css`）经 lightningcss 编译进 bundle；不引入
   UI 框架样式库。
+
+## Agent 公告约定（issue #839）
+
+- 会向 agent 系统提示注入公告（systemPrompt section）的插件必须提供
+  `announceToAgent` 开关：schema 默认 `false`（默认不注入，保持系统提示词干净），
+  用户在设置界面（或 profile patch）按需开启；开关必须经
+  `installSettingsSection`（或等价的自定义设置卡）暴露到 Web 设置界面并即时生效。
+- 公告文本只陈述能力、约束与触发词，不包含与当前任务无关的长段声明。
 
 ## 测试纪律
 
@@ -50,6 +58,18 @@
   （右侧面板由 dsh-better-sidebar 接管），后续版本将从聚合包移除。
 - 例外：dsh-live-stats（实时令牌估算）已彻底移除——包、测试、门禁与文档引用
   均已清理，不再支持。
+
+## 语义属性约定（L2，issue #506）
+
+- 插件根容器与关键部件必须输出语义属性：根容器打 `data-dsh-plugin="<插件短名>"`，
+  部件打裸值 `data-dsh-part`（归属交给 plugin 属性，如 `column` 而非
+  `task-board-column`）；枚举、owner 与锚定方式见
+  [skins/skin-center/contracts/semantic-attrs-v1.md](skins/skin-center/contracts/semantic-attrs-v1.md)。
+- 新增/修改枚举值必须与该契约表同 PR 更新；每个值要有 owner、含义与锚定方式，
+  不得只堆字符串。
+- 不输出语义属性的插件只享受 L1 token 基础换肤覆盖，不承诺完整覆盖。
+- 不复用官方 `data-plugin`（它标注 style 标签归属，语义不同）；body/html 级
+  属性不属于 surface/part/plugin 枚举。
 
 ## 双语纪律
 

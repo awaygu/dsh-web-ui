@@ -37,8 +37,14 @@ export const BLUR_EMPTY_FIELD = 'backgroundBlurEmpty'
 /** Field of the with-content backdrop blur inside the namespace section. */
 export const BLUR_CONTENT_FIELD = 'backgroundBlurContent'
 
+/** Field of the composer card backdrop blur inside the namespace section. */
+export const INPUT_CARD_BLUR_FIELD = 'inputCardBlur'
+
 /** CSS custom property written to document.body and read by backdrop skins. */
 export const SCRIM_VAR = '--dsw-skin-scrim'
+
+/** CSS custom property consumed by the shared composer neutralizer. */
+export const INPUT_CARD_BLUR_VAR = '--dsh-input-card-blur'
 
 /** Default occlusion (0 = no extra veil) when the section carries none. */
 export const DEFAULT_OPACITY = 0
@@ -58,6 +64,8 @@ export interface SkinBackgroundHandle {
   blurEmpty(): number
   /** Current with-content backdrop blur 0-20 px. */
   blurContent(): number
+  /** Current input-card backdrop blur 0-20 px. */
+  inputCardBlur(): number
   /** Observe a change in the applied values. */
   subscribe(listener: () => void): () => void
   /** Apply + persist a new occlusion. */
@@ -66,19 +74,22 @@ export interface SkinBackgroundHandle {
   setBlurEmpty(value: number): void
   /** Apply + persist a new with-content backdrop blur (0-20 px). */
   setBlurContent(value: number): void
+  /** Apply + persist a new input-card backdrop blur (0-20 px). */
+  setInputCardBlur(value: number): void
   /** Tear down the blur element and MutationObserver. */
   dispose(): void
 }
 
 /**
  * Selector for a conversation message row inside the shell's center column.
- * The `data-pane="conversation"` attribute is stamped by the dsh-web-ui-all
- * compat shim on the center column; the _userRow / _compactionRow /
- * _contextRow / _turnErrorRow suffixes are the official shell's CSS-module
- * hashed message-row classes (hash prefix varies, suffix is stable). Stable
- * like the repo's compat shim, not hash-dependent.
+ * Official shell message rows carry `data-chat-anchor-key`; the
+ * `data-pane="conversation"` attribute is stamped by the dsh-web-ui-all compat
+ * shim on the center column, where the _userRow / _compactionRow /
+ * _contextRow / _turnErrorRow suffixes are CSS-module message-row classes
+ * (hash prefix varies, suffix is stable).
  */
 const CONVERSATION_CONTENT_SELECTOR = [
+  '[data-chat-anchor-key]',
   '[data-pane="conversation"] [class*="_userRow"]',
   '[data-pane="conversation"] [class*="_compactionRow"]',
   '[data-pane="conversation"] [class*="_contextRow"]',
@@ -95,12 +106,14 @@ export class BackgroundController implements SkinBackgroundHandle {
   private opacityValue = DEFAULT_OPACITY
   private blurEmptyValue = DEFAULT_BLUR
   private blurContentValue = DEFAULT_BLUR
+  private inputCardBlurValue = 10
   private readonly listeners = new Set<() => void>()
   private readonly scope: SettingsScope<{
     enabled?: boolean
     backgroundOpacity?: number
     backgroundBlurEmpty?: number
     backgroundBlurContent?: number
+    inputCardBlur?: number
   }>
   /** The fixed backdrop-filter element, present only while active blur > 0. */
   private blurElement: HTMLDivElement | null = null
@@ -119,42 +132,50 @@ export class BackgroundController implements SkinBackgroundHandle {
     backgroundOpacity?: number
     backgroundBlurEmpty?: number
     backgroundBlurContent?: number
+    inputCardBlur?: number
   }>) {
     this.scope = scope
     this.enabledValue = this.readEnabled()
     this.opacityValue = this.readOpacity()
     this.blurEmptyValue = this.readBlur(BLUR_EMPTY_FIELD)
     this.blurContentValue = this.readBlur(BLUR_CONTENT_FIELD)
+    this.inputCardBlurValue = this.readInputCardBlur()
     this.applyOcclusion()
+    this.applyInputCardBlur()
     this.syncBlur()
     scope.subscribe(() => {
       this.enabledValue = this.readEnabled()
       this.opacityValue = this.readOpacity()
       this.blurEmptyValue = this.readBlur(BLUR_EMPTY_FIELD)
       this.blurContentValue = this.readBlur(BLUR_CONTENT_FIELD)
+      this.inputCardBlurValue = this.readInputCardBlur()
       this.applyOcclusion()
+      this.applyInputCardBlur()
       this.syncBlur()
       this.publish()
     })
   }
 
-  enabled(): boolean { return this.enabledValue }
+  enabled = (): boolean => this.enabledValue
 
   setEnabled(value: boolean): void {
     this.enabledValue = value
     this.applyOcclusion()
+    this.applyInputCardBlur()
     this.syncBlur()
     this.publish()
     void this.scope.set('enabled', value)
   }
 
-  opacity(): number { return this.opacityValue }
+  opacity = (): number => this.opacityValue
 
-  blurEmpty(): number { return this.blurEmptyValue }
+  blurEmpty = (): number => this.blurEmptyValue
 
-  blurContent(): number { return this.blurContentValue }
+  blurContent = (): number => this.blurContentValue
 
-  subscribe(listener: () => void): () => void {
+  inputCardBlur = (): number => this.inputCardBlurValue
+
+  subscribe = (listener: () => void): (() => void) => {
     this.listeners.add(listener)
     return () => { this.listeners.delete(listener) }
   }
@@ -187,6 +208,14 @@ export class BackgroundController implements SkinBackgroundHandle {
     void this.scope.set(BLUR_CONTENT_FIELD, clamped)
   }
 
+  setInputCardBlur(value: number): void {
+    const clamped = this.clampBlur(value)
+    this.inputCardBlurValue = clamped
+    this.applyInputCardBlur()
+    this.publish()
+    void this.scope.set(INPUT_CARD_BLUR_FIELD, clamped)
+  }
+
   dispose(): void {
     this.disposed = true
     if (this.rafId !== null) {
@@ -194,6 +223,7 @@ export class BackgroundController implements SkinBackgroundHandle {
       this.rafId = null
     }
     this.removeBlurElement()
+    document.body.style.removeProperty(INPUT_CARD_BLUR_VAR)
     if (this.observer !== null) {
       this.observer.disconnect()
       this.observer = null
@@ -215,6 +245,13 @@ export class BackgroundController implements SkinBackgroundHandle {
     return Math.max(0, Math.min(100, raw))
   }
 
+  private readInputCardBlur(): number {
+    const snapshot: SettingsScopeSnapshot<{ inputCardBlur?: number }> = this.scope.getSnapshot()
+    const raw = snapshot.value?.inputCardBlur
+    if (typeof raw !== 'number' || !Number.isFinite(raw)) return 10
+    return this.clampBlur(raw)
+  }
+
   /** The effective blur section value for one field, clamped 0-20, defaulting to 0. */
   private readBlur(field: 'backgroundBlurEmpty' | 'backgroundBlurContent'): number {
     const snapshot: SettingsScopeSnapshot<{
@@ -228,6 +265,14 @@ export class BackgroundController implements SkinBackgroundHandle {
 
   private clampBlur(value: number): number {
     return Math.max(0, Math.min(20, Math.round(value)))
+  }
+
+  private applyInputCardBlur(): void {
+    if (!this.enabledValue) {
+      document.body.style.removeProperty(INPUT_CARD_BLUR_VAR)
+      return
+    }
+    document.body.style.setProperty(INPUT_CARD_BLUR_VAR, this.inputCardBlurValue + 'px')
   }
 
   /** Write the current occlusion onto the body CSS variable (0..1 alpha). */
@@ -246,6 +291,13 @@ export class BackgroundController implements SkinBackgroundHandle {
    */
   private syncBlur(): void {
     if (this.disposed) return
+    if (this.hasWallpaper()) {
+      // The wallpaper module owns its own blur (wallpaperBlur); the skin-center
+      // background blur layer must stay off while a wallpaper is mounted so
+      // the two settings remain independent (#777 decouple).
+      this.removeBlurElement()
+      return
+    }
     if (!this.enabledValue) {
       this.removeBlurElement()
       return
@@ -259,6 +311,11 @@ export class BackgroundController implements SkinBackgroundHandle {
   /** True when the conversation pane hosts at least one message row. */
   private hasConversationContent(): boolean {
     return document.querySelector(CONVERSATION_CONTENT_SELECTOR) !== null
+  }
+
+  /** True while a Wallpaper Engine wallpaper is mounted. */
+  private hasWallpaper(): boolean {
+    return document.documentElement.hasAttribute('data-dsh-wallpaper-active')
   }
 
   /** Create (if needed) and size the fixed backdrop-filter element. */
@@ -300,6 +357,12 @@ export class BackgroundController implements SkinBackgroundHandle {
       subtree: true,
       attributes: true,
       attributeFilter: ['class'],
+    })
+    // Also react to the wallpaper marker so the background blur layer is
+    // removed/restored exactly when a wallpaper mounts/unmounts.
+    this.observer.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ['data-dsh-wallpaper-active'],
     })
   }
 

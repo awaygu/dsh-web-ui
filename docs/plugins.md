@@ -40,7 +40,7 @@ packages/<name>/
 - `patchFrom`：该包的 `cordis.patch.yml` insert 行会被汇总进聚合包 patch；
 - `deps`：解析为包名写入聚合包 `package.json` 的 `dependencies`（`workspace:*`）。
 
-皮肤（新增或改动）不需要进任何 aggregate.yml：`packages/dsh-skins/build.mjs` 会把 `packages/skins/<id>` 的 `skin.json` + `lib/client.js` 复制进 `dsh-skins/skins/<id>`（npm 上皮肤资产全部内置在 dsh-skins 一个包里，避免为每个皮肤包名付 npm 新包名费用）。改完皮肤后运行 `pnpm --filter @linxin666/dsh-skins build`。皮肤启用互斥由 `dsh-skin use` 管理（当前 Web profile 的 `<harness-home>/profiles/<profile>/cordis.patch.yml` managed 区段）。
+皮肤（新增或改动）不需要进任何 aggregate.yml：皮肤是纯资产目录，内置在 `packages/skins/skin-center/skins/<id>/`，随 `@linxin666/dsh-client-ui-skin-center` 一个包分发（`dsh-skins` 聚合包是只带依赖的退役载具，保留一个发布周期）。改完皮肤后运行 `pnpm skin-center:check` 与 `node scripts/gallery-build`。皮肤启用互斥由 `dsh-skin use` 管理（客户端原子切换，不改 cordis.patch.yml）。
 
 ### 4. 重新生成聚合包
 
@@ -113,6 +113,7 @@ dsh plugin --profile web add link:<dsh-web-ui>/packages/dsh-web-ui-all
 ## 插件规范要点
 
 - **package.json 的 `dsh.bundle.patch` 声明**：指向包内 `cordis.patch.yml`，这是官方 bundle 清单，`dsh plugin` 依赖它识别与挂载插件。
+- **`dsh.engines.dsh` 最低运行时声明**（issue #754）：每个发布包必须在 `dsh` 对象内声明 `"engines": { "dsh": ">=X.Y.Z[-rc.N]" }`（如 `"dsh": ">=0.1.1-rc.1"`），唯一支持形式为 `>= <semver>`（顶层 `engines.dsh` 是插件管理器兼容读取的备用位，新声明统一用 `dsh.engines.dsh`）。该字段随 npm 清单发布，插件管理器在更新检查与更新前读取并据此提示/拦截；`scripts/family-dsh-engines.test.mjs` 强制每个家族包与插件模板都声明。SDK cohort 升级时若引入新的运行时契约，必须同步提升所有包的该字段。
 - **cordis.patch.yml insert 行格式**（包名用家族 scope `@linxin666`，与 npm 发布名一致）：
 
 ```yaml

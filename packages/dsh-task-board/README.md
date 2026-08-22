@@ -18,7 +18,7 @@ A hot-pluggable DeepSeek Harness (DSH) Web GUI plugin with a Host-authoritative 
 - **Deterministic recovery**: a running execution with a recorded session is observed after restart; an interrupted start without a session id is cancelled and is not resent.
 - **Live synchronization**: mutations return a full revisioned snapshot; SSE announces revision, scheduler, and power changes, while reconnect and page visibility recovery fetch a full snapshot.
 - **Optional idle-sleep protection**: off by default; when enabled it covers every running DSH session, enabled non-archived task-board schedules, and unknown session state.
-- **System-prompt injection**: the Host registers a `plugin:task-board` section (order 200) through `SystemPrompt.section`, and the task-board settings can disable the announcement without disabling the board.
+- **System-prompt injection**: the Host registers a `plugin:task-board` section (order 200) through `SystemPrompt.section`, and the task-board settings can disable the announcement without disabling the board. The guidance also reminds agents to close any visible `todo_write` plan before the final answer.
 
 ## Architecture and protocol
 
@@ -34,7 +34,7 @@ A hot-pluggable DeepSeek Harness (DSH) Web GUI plugin with a Host-authoritative 
 Install the aggregate package or this package alone, then restart `dsh web`:
 
 ```sh
-dsh plugin --profile web add @linxin666/dsh-client-ui-task-board
+dsh plugin --profile web add @linxin666/dsh-client-ui-task-board@latest
 ```
 
 For local development:
@@ -52,7 +52,7 @@ dsh plugin --profile web add link:$(pwd)/packages/dsh-task-board
 | Key | Default | Behavior |
 | --- | --- | --- |
 | `enabled` | `true` | Enables the Host service and browser board. |
-| `announceToAgent` | `true` | Adds the task-board guidance section to agent system prompts. |
+| `announceToAgent` | `false` | Opt-in: when true, adds the task-board guidance section to agent system prompts. |
 | `preventIdleSleep` | `false` | Holds one system idle-sleep assertion while any DSH session runs, any schedule is enabled, or session state is unknown. |
 | `trustedProxyHosts` | `[]` | Canonical `host[:port]` authorities accepted only through the authenticated loopback reverse-proxy path. |
 | `proxyTokenEnv` | `DSH_TASK_BOARD_PROXY_TOKEN` | Environment variable containing the reverse-proxy token; the token itself is never stored in plugin config. |

@@ -23,13 +23,13 @@ import { applyCreateTask } from './use-cases/task-create.ts'
 import { applyDeleteTask } from './use-cases/task-delete.ts'
 import { applyScheduleNextRun as applyScheduleRollForward, applySetSchedule } from './use-cases/task-schedule.ts'
 import { applyUpdateTask, type TaskUpdatePatch } from './use-cases/task-update.ts'
-import type { TaskBoardAction, TaskBoardSnapshot } from '../protocol.ts'
+import type { TaskBoardAction, TaskBoardEventPayload, TaskBoardSnapshot } from '../protocol.ts'
 
 export interface TaskBoardTransport {
   bootstrap(legacy: readonly TaskRecord[]): Promise<TaskBoardSnapshot>
   state(): Promise<TaskBoardSnapshot>
   action(action: TaskBoardAction): Promise<TaskBoardSnapshot>
-  subscribe(listener: () => void): () => void
+  subscribe(listener: (event?: TaskBoardEventPayload) => void): () => void
 }
 
 /** The sessions face the controller needs for navigation awareness. */
@@ -509,7 +509,15 @@ export class BoardController {
   /** Settle tasks left 'running' whose sessions already finished. */
   private async reconcileRunningTasks(): Promise<void> {
     if (this.deps.exec === undefined) return
-    if (this.reconcileInFlight) return
+    if (this.reconcileInFlight) {
+      // A session change arrived while a pass was in flight. The in-flight
+      // pass already captured the task list it iterates and will not revisit
+      // this task, so dropping the notification would leave it stuck
+      // 'running'. Re-arm the debounce so the change is reconciled once the
+      // current pass settles.
+      this.scheduleReconcile()
+      return
+    }
     this.reconcileInFlight = true
     try {
       type Settled = Extract<ExecutionEvent, { kind: 'settled' }>
@@ -601,7 +609,7 @@ export class BoardController {
       this.acceptRemote(await transport.bootstrap(this.tasks))
       if (!this.remoteSubscribed) {
         this.remoteSubscribed = true
-        this.disposers.push(transport.subscribe(() => { void this.refreshRemote() }))
+        this.disposers.push(transport.subscribe((event) => { this.onRemoteEvent(event) }))
       }
       return true
     } catch (error) {
@@ -609,6 +617,23 @@ export class BoardController {
       this.notify()
       return false
     }
+  }
+
+  /**
+   * SSE frames carry revision/scheduler/power. When the revision matches the
+   * one already applied, apply the frame's scheduler/power in place and skip
+   * the full /state fetch; otherwise the 5 s heartbeat would re-clone and
+   * re-serialize the whole ledger per tab even while nothing changes.
+   */
+  private onRemoteEvent(event: TaskBoardEventPayload | undefined): void {
+    if (event !== undefined && this.hostState !== undefined && event.revision === this.hostState.revision
+      && typeof event.scheduler === 'object' && event.scheduler !== null
+      && typeof event.power === 'object' && event.power !== null) {
+      this.hostState = { revision: event.revision, scheduler: event.scheduler, power: event.power }
+      this.notify()
+      return
+    }
+    void this.refreshRemote()
   }
 
   private async refreshRemote(preserveError?: string): Promise<boolean> {

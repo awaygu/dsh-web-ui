@@ -11,6 +11,7 @@ import {
   checkUpdates,
   compareVersions,
   familyChildren,
+  fetchLatestVersion,
   findProfile,
   isLinkedSpec,
   parseSemver,
@@ -263,6 +264,23 @@ describe("checkUpdates", () => {
     // update itself is refused for dev installs.
     expect(status.outdated).toBe(true)
   })
+  it("flags a linked aggregate child as dev mode", async () => {
+    const anchor = npmFixture()
+    const profileDir = join(fixture!, 'profiles', 'web')
+    writeManifest(profileDir, {
+      name: "dsh-profile-web",
+      dependencies: {
+        [AGGREGATE_PACKAGE]: "^0.1.10",
+        "@linxin666/dsh-ssh": "link:../../../code/dsh-web-ui/packages/dsh-ssh",
+      },
+    })
+    const status = await checkUpdates({
+      anchorManifestPath: anchor,
+      resolve: () => anchor,
+      fetchLatest: async () => "0.1.11",
+    })
+    expect(status.mode).toBe("link")
+  })
   it("reports registry outage when every probe fails", async () => {
     const anchor = npmFixture()
     const status = await checkUpdates({
@@ -316,6 +334,18 @@ describe("resolveUpdateTarget", () => {
     const anchorDir = join(profileDir, 'node_modules', '@linxin666', 'dsh-web-ui-all')
     writeManifest(anchorDir, { name: AGGREGATE_PACKAGE, version: "0.1.10" })
     expect(resolveUpdateTarget({ anchorManifestPath: join(anchorDir, "package.json") })).toEqual({ error: "link" })
+  })
+  it("rejects a linked aggregate child override", () => {
+    const anchor = npmFixture()
+    const profileDir = join(fixture!, 'profiles', 'web')
+    writeManifest(profileDir, {
+      name: "dsh-profile-web",
+      dependencies: {
+        [AGGREGATE_PACKAGE]: "^0.1.10",
+        "@linxin666/dsh-ssh": "link:../../../code/dsh-web-ui/packages/dsh-ssh",
+      },
+    })
+    expect(resolveUpdateTarget({ anchorManifestPath: anchor })).toEqual({ error: "link" })
   })
   it("rejects a missing anchor", () => {
     expect(resolveUpdateTarget({ anchorManifestPath: undefined })).toEqual({ error: "not-found" })
@@ -797,5 +827,27 @@ describe("runUpdateVerified", () => {
     expect(result.ok).toBe(false)
     expect(result.errorCode).toBe("verify-failed")
     expect(result.exitCode).toBe(0)
+  })
+})
+
+describe('fetchLatestVersion', () => {
+  it('passes the abort signal to the fetch implementation', async () => {
+    const fetchImpl = vi.fn(async (_url: string, _init?: RequestInit) => ({
+      ok: true,
+      json: async () => ({ version: '1.2.3' }),
+    }))
+    const version = await fetchLatestVersion('@linxin666/dsh-remote-web-ui', fetchImpl)
+    expect(version).toBe('1.2.3')
+    expect(fetchImpl).toHaveBeenCalledTimes(1)
+    const [url, init] = fetchImpl.mock.calls[0] as [string, RequestInit | undefined]
+    expect(String(url)).toContain('/latest')
+    expect(init?.signal).toBeInstanceOf(AbortSignal)
+  })
+
+  it('returns undefined when the registry probe rejects', async () => {
+    const fetchImpl = vi.fn(async () => {
+      throw new Error('network down')
+    })
+    await expect(fetchLatestVersion('@linxin666/dsh-remote-web-ui', fetchImpl)).resolves.toBeUndefined()
   })
 })

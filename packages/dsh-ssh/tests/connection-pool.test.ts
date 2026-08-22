@@ -170,6 +170,44 @@ describe('connectClient', () => {
   })
 })
 
+describe('buildConnectConfig agent auth', () => {
+  it('uses an explicit agent path', () => {
+    const entry = passwordEntry('agent', { auth: { kind: 'agent', agentPath: '/tmp/agent.sock' } })
+    const config = buildConnectConfig(entry, undefined, defaultOpts() as never)
+    expect(config.agent).toBe('/tmp/agent.sock')
+    expect(config.password).toBeUndefined()
+    expect(config.privateKey).toBeUndefined()
+  })
+
+  it('falls back to SSH_AUTH_SOCK when no agent path is configured', () => {
+    const previous = process.env.SSH_AUTH_SOCK
+    process.env.SSH_AUTH_SOCK = '/tmp/auto-agent.sock'
+    try {
+      const entry = passwordEntry('agent-auto', { auth: { kind: 'agent' } })
+      const config = buildConnectConfig(entry, undefined, defaultOpts() as never)
+      expect(config.agent).toBe('/tmp/auto-agent.sock')
+    } finally {
+      if (previous === undefined) delete process.env.SSH_AUTH_SOCK
+      else process.env.SSH_AUTH_SOCK = previous
+    }
+  })
+
+  it('rejects agent auth when no agent endpoint is available', () => {
+    const previous = process.env.SSH_AUTH_SOCK
+    delete process.env.SSH_AUTH_SOCK
+    const previousPlatform = process.platform
+    // Force the non-Windows branch (Pageant is the Windows fallback).
+    Object.defineProperty(process, 'platform', { value: 'linux' })
+    try {
+      const entry = passwordEntry('agent-none', { auth: { kind: 'agent' } })
+      expect(() => buildConnectConfig(entry, undefined, defaultOpts() as never)).toThrow(/ssh-agent is not available/)
+    } finally {
+      if (previous !== undefined) process.env.SSH_AUTH_SOCK = previous
+      Object.defineProperty(process, 'platform', { value: previousPlatform })
+    }
+  })
+})
+
 describe('connectChain', () => {
   beforeEach(() => {
     sshMock.instances.length = 0
@@ -207,5 +245,34 @@ describe('connectChain', () => {
     expect(hopInstance.connectConfig?.keepaliveInterval).toBe(1)
     expect(targetInstance.connectConfig?.readyTimeout).toBe(1)
     expect(targetInstance.connectConfig?.keepaliveInterval).toBe(1)
+  })
+
+  it('ends already-connected hops when a middle-hop connect fails', async () => {
+    const hopA = passwordEntry('a', { proxyJump: [] })
+    const hopB = passwordEntry('b', { proxyJump: [] })
+    const target = passwordEntry('target', { proxyJump: ['a', 'b'] })
+    const store = fakeStore([hopA, hopB, target])
+    // Hop A connects and forwards; hop B fails its handshake.
+    sshMock.behaviors.push((client) => { client.emit('ready') })
+    sshMock.behaviors.push((client) => { client.emit('error', new Error('Connection lost before handshake')) })
+
+    const engine = {
+      store,
+      opts: { idleTimeoutMs: 1, connectTimeoutMs: 1, keepaliveIntervalMs: 1, maxOutputBytes: 1, defaultExecTimeoutMs: 1, defaultMaxWorkers: 1, sftpConcurrency: 1 },
+      pool: new Map(),
+      acquireQueue: new Map(),
+    }
+
+    await expect(connectChain(engine as never, target)).rejects.toThrow('Connection lost before handshake')
+
+    const hopAInstance = sshMock.instances[0]
+    const hopBInstance = sshMock.instances[1]
+    expect(hopAInstance).toBeDefined()
+    expect(hopBInstance).toBeDefined()
+    expect(hopAInstance.forwardOutCalls).toBe(1)
+    // The already-connected hop A must be closed so no middle-hop leaks.
+    expect(hopAInstance.endCalls).toBe(1)
+    // The failed hop B is destroyed by connectClient on its own failure.
+    expect(hopBInstance.destroyCalls).toBe(1)
   })
 })
